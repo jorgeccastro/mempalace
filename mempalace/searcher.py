@@ -6,7 +6,7 @@ Semantic search against the palace.
 Returns verbatim text — the actual words, never summaries.
 """
 
-import sys
+
 from pathlib import Path
 
 import chromadb
@@ -23,7 +23,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     except Exception:
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
-        sys.exit(1)
+        return
 
     # Build where filter
     where = {}
@@ -47,7 +47,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
 
     except Exception as e:
         print(f"\n  Search error: {e}")
-        sys.exit(1)
+        return
 
     docs = results["documents"][0]
     metas = results["metadatas"][0]
