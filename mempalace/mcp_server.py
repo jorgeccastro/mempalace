@@ -466,9 +466,10 @@ def tool_diary_read(agent_name: str, last_n: int = 10):
         return {"error": str(e)}
 
 
-def tool_diary_delete(agent_name: str, entry_id: str):
+def tool_diary_delete(entry_id: str):
     """
     Delete a specific diary entry by its entry_id.
+    Admin tool — no caller identity enforcement (MCP has no transport-level auth).
     Use diary_read to find entry IDs first.
     """
     col = _get_collection()
@@ -476,14 +477,9 @@ def tool_diary_delete(agent_name: str, entry_id: str):
         return _no_palace()
 
     try:
-        # Verify the entry exists and belongs to this agent
         results = col.get(ids=[entry_id], include=["metadatas"])
         if not results["ids"]:
             return {"success": False, "error": f"Entry '{entry_id}' not found."}
-        meta = results["metadatas"][0]
-        expected_wing = f"wing_{agent_name.lower().replace(' ', '_')}"
-        if meta.get("wing") != expected_wing:
-            return {"success": False, "error": f"Entry belongs to a different agent."}
 
         col.delete(ids=[entry_id])
         return {"success": True, "deleted": entry_id}
@@ -741,20 +737,16 @@ TOOLS = {
         "handler": tool_diary_read,
     },
     "mempalace_diary_delete": {
-        "description": "Delete a specific diary entry by ID. Use diary_read to find entry IDs first.",
+        "description": "Delete a diary entry by ID. Admin tool — no caller auth (MCP has no transport-level identity). Use diary_read to find entry IDs first.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "agent_name": {
-                    "type": "string",
-                    "description": "Your name — must match the agent who wrote the entry",
-                },
                 "entry_id": {
                     "type": "string",
                     "description": "The entry_id to delete (from diary_read results)",
                 },
             },
-            "required": ["agent_name", "entry_id"],
+            "required": ["entry_id"],
         },
         "handler": tool_diary_delete,
     },
