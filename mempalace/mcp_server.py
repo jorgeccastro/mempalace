@@ -442,9 +442,10 @@ def tool_diary_read(agent_name: str, last_n: int = 10):
 
         # Combine and sort by timestamp
         entries = []
-        for doc, meta in zip(results["documents"], results["metadatas"]):
+        for entry_id, doc, meta in zip(results["ids"], results["documents"], results["metadatas"]):
             entries.append(
                 {
+                    "entry_id": entry_id,
                     "date": meta.get("date", ""),
                     "timestamp": meta.get("filed_at", ""),
                     "topic": meta.get("topic", ""),
@@ -463,6 +464,31 @@ def tool_diary_read(agent_name: str, last_n: int = 10):
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+def tool_diary_delete(agent_name: str, entry_id: str):
+    """
+    Delete a specific diary entry by its entry_id.
+    Use diary_read to find entry IDs first.
+    """
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    try:
+        # Verify the entry exists and belongs to this agent
+        results = col.get(ids=[entry_id], include=["metadatas"])
+        if not results["ids"]:
+            return {"success": False, "error": f"Entry '{entry_id}' not found."}
+        meta = results["metadatas"][0]
+        expected_wing = f"wing_{agent_name.lower().replace(' ', '_')}"
+        if meta.get("wing") != expected_wing:
+            return {"success": False, "error": f"Entry belongs to a different agent."}
+
+        col.delete(ids=[entry_id])
+        return {"success": True, "deleted": entry_id}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # ==================== MCP PROTOCOL ====================
@@ -713,6 +739,24 @@ TOOLS = {
             "required": ["agent_name"],
         },
         "handler": tool_diary_read,
+    },
+    "mempalace_diary_delete": {
+        "description": "Delete a specific diary entry by ID. Use diary_read to find entry IDs first.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_name": {
+                    "type": "string",
+                    "description": "Your name — must match the agent who wrote the entry",
+                },
+                "entry_id": {
+                    "type": "string",
+                    "description": "The entry_id to delete (from diary_read results)",
+                },
+            },
+            "required": ["agent_name", "entry_id"],
+        },
+        "handler": tool_diary_delete,
     },
 }
 
