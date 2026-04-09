@@ -1,0 +1,9 @@
+{
+  "type": "stdio",
+  "command": "__HOME__/.mempalace-env/bin/python",
+  "args": [
+    "-m",
+    "mempalace.mcp_server"
+  ],
+  "env": {}
+}
