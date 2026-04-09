@@ -34,13 +34,37 @@ If MCP tools are available, use them in this priority order:
   between two wings. Use when the user asks about relationships between
   different knowledge domains.
 
-## 4. CLI Fallback
+## 4. Low-Token Retrieval Strategy
+
+Keep retrieval cheap by default. Prefer a few short searches over one large
+dump.
+
+Recommended order:
+
+1. Run one short natural-language query with a small limit (`3` to `5`).
+2. If the top result is weak or ambiguous, run a second query using only the
+   core keywords.
+3. Only if still needed, run a third query with synonyms, aliases, or
+   alternate wording (including PT/EN variants when relevant).
+
+Additional rules:
+- Do not fetch `10+` results unless the task truly needs broad review.
+- Do not call taxonomy discovery tools by reflex; use them only when wing/room
+  mapping is blocked.
+- For durable facts, prefer `mempalace_kg_query` before broad search.
+- For recent work, decisions, handoff, or session history, prefer diary search
+  (`mempalace_diary_read` or room=`diary`) before wider retrieval.
+- Start broad, then narrow with wing/room only after you have a concrete lead.
+- If the first search is weak, reformulate. Do not pretend the first hit is
+  good enough.
+
+## 5. CLI Fallback
 
 If MCP tools are not available, fall back to the CLI:
 
     mempalace search "query" [--wing X] [--room Y]
 
-## 5. Present Results
+## 6. Present Results
 
 When presenting search results:
 - Always include source attribution: wing, room, and drawer for each result
@@ -48,7 +72,7 @@ When presenting search results:
 - Group results by wing/room when returning multiple hits
 - Quote or summarize the memory content clearly
 
-## 6. Offer Next Steps
+## 7. Offer Next Steps
 
 After presenting results, offer the user options to go deeper:
 - Drill deeper -- search within a specific room or narrow the query
