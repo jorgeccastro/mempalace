@@ -9,6 +9,7 @@ Returns verbatim text — the actual words, never summaries.
 import logging
 import re
 import unicodedata
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -20,6 +21,9 @@ logger = logging.getLogger("mempalace_mcp")
 DEFAULT_OVERFETCH_FACTOR = 5
 DEFAULT_MIN_CANDIDATES = 25
 DEFAULT_HYBRID_WEIGHT = 0.30
+DEFAULT_QUOTED_PHRASE_WEIGHT = 0.60
+DEFAULT_ENTITY_WEIGHT = 0.22
+DEFAULT_TEMPORAL_WEIGHT = 0.35
 DEFAULT_PREFIX_MATCH_WEIGHT = 0.92
 DEFAULT_FUZZY_MATCH_WEIGHT = 0.84
 
@@ -174,6 +178,94 @@ STOP_WORDS = {
     "your",
 }
 
+NOTABLE_ENTITY_WORDS = {
+    "And",
+    "Ao",
+    "Aos",
+    "As",
+    "At",
+    "Can",
+    "Com",
+    "Como",
+    "Could",
+    "Da",
+    "Das",
+    "De",
+    "Did",
+    "Do",
+    "Does",
+    "Dos",
+    "E",
+    "Ela",
+    "Ele",
+    "Em",
+    "Esta",
+    "Este",
+    "For",
+    "From",
+    "Ha",
+    "How",
+    "I",
+    "In",
+    "Is",
+    "Isto",
+    "It",
+    "Its",
+    "Just",
+    "Last",
+    "May",
+    "Monday",
+    "More",
+    "My",
+    "Na",
+    "Nas",
+    "No",
+    "Nos",
+    "November",
+    "O",
+    "October",
+    "On",
+    "Onde",
+    "Os",
+    "Our",
+    "Para",
+    "Pela",
+    "Pelas",
+    "Pelo",
+    "Pelos",
+    "Por",
+    "Previously",
+    "Qual",
+    "Quando",
+    "Que",
+    "Quem",
+    "Recently",
+    "Saturday",
+    "September",
+    "Se",
+    "Sem",
+    "Should",
+    "Sunday",
+    "That",
+    "The",
+    "Their",
+    "This",
+    "Thursday",
+    "To",
+    "Tuesday",
+    "Wednesday",
+    "What",
+    "When",
+    "Where",
+    "Which",
+    "Who",
+    "Why",
+    "Will",
+    "With",
+    "Would",
+    "You",
+}
+
 
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
@@ -185,17 +277,52 @@ def _normalize_text(text: str) -> str:
     return text.lower()
 
 
-def _extract_keywords(text: str) -> list[str]:
+def _utc_now() -> datetime:
+    return datetime.now()
+
+
+def _extract_keywords(text: str, excluded_tokens: set[str] = None) -> list[str]:
     normalized = _normalize_text(text)
     tokens = re.findall(r"\b[a-z0-9]{3,}\b", normalized)
     seen = set()
     keywords = []
+    excluded_tokens = excluded_tokens or set()
     for token in tokens:
-        if token in STOP_WORDS or token in seen:
+        if token in STOP_WORDS or token in excluded_tokens or token in seen:
             continue
         seen.add(token)
         keywords.append(token)
     return keywords
+
+
+def _extract_quoted_phrases(text: str) -> list[str]:
+    phrases = []
+    for pattern in (r"'([^']{3,80})'", r'"([^"]{3,80})"', r"“([^”]{3,80})”", r"‘([^’]{3,80})’"):
+        phrases.extend(re.findall(pattern, text))
+
+    seen = set()
+    unique = []
+    for phrase in phrases:
+        cleaned = phrase.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            unique.append(cleaned)
+    return unique
+
+
+def _extract_notable_entities(text: str) -> list[str]:
+    candidates = re.findall(r"\b(?:[A-Z][a-z0-9]{2,15}|[A-Z0-9]{2,15})\b", text)
+    seen = set()
+    entities = []
+    for candidate in candidates:
+        if candidate in NOTABLE_ENTITY_WORDS:
+            continue
+        normalized = _normalize_text(candidate)
+        if len(normalized) < 3 or normalized in seen:
+            continue
+        seen.add(normalized)
+        entities.append(candidate)
+    return entities
 
 
 def _token_match_score(query_token: str, doc_token: str) -> float:
@@ -239,10 +366,138 @@ def _keyword_overlap(query_keywords: list[str], doc_text: str) -> float:
     return sum(scores) / len(scores)
 
 
+def _quoted_phrase_overlap(phrases: list[str], doc_text: str) -> float:
+    if not phrases:
+        return 0.0
+
+    normalized_doc = _normalize_text(doc_text)
+    hits = sum(1 for phrase in phrases if _normalize_text(phrase) in normalized_doc)
+    return hits / len(phrases)
+
+
+def _entity_overlap(entities: list[str], doc_text: str) -> float:
+    if not entities:
+        return 0.0
+
+    doc_tokens = set(re.findall(r"\b[a-z0-9]{3,}\b", _normalize_text(doc_text)))
+    if not doc_tokens:
+        return 0.0
+
+    hits = 0
+    for entity in entities:
+        token = _normalize_text(entity)
+        if token in doc_tokens:
+            hits += 1
+
+    return hits / len(entities)
+
+
 def _distance_to_similarity(distance: float) -> float:
     # Chroma's default metric is l2, so 1 - distance can go negative.
     # Convert to a bounded "closer is higher" score for display/API stability.
     return round(1.0 / (1.0 + max(distance, 0.0)), 3)
+
+
+def _parse_metadata_datetime(metadata: dict) -> datetime | None:
+    raw_date = metadata.get("date")
+    if raw_date:
+        try:
+            return datetime.fromisoformat(str(raw_date))
+        except ValueError:
+            pass
+
+    for key in ("timestamp", "filed_at"):
+        value = metadata.get(key)
+        if not value:
+            continue
+        try:
+            cleaned = str(value).replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(cleaned)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone().replace(tzinfo=None)
+            return parsed
+        except ValueError:
+            continue
+
+    source_mtime = metadata.get("source_mtime")
+    if source_mtime not in (None, ""):
+        try:
+            return datetime.fromtimestamp(float(source_mtime))
+        except (TypeError, ValueError, OSError):
+            return None
+
+    return None
+
+
+def _extract_temporal_signal(query: str, reference_now: datetime = None) -> tuple[datetime, int] | None:
+    now = reference_now or _utc_now()
+    normalized = _normalize_text(query)
+
+    match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", normalized)
+    if match:
+        try:
+            return datetime.fromisoformat(match.group(1)), 1
+        except ValueError:
+            pass
+
+    direct_patterns = [
+        (r"\b(today|hoje)\b", (now, 1)),
+        (r"\b(yesterday|ontem)\b", (now - timedelta(days=1), 1)),
+        (r"\b(day before yesterday|anteontem)\b", (now - timedelta(days=2), 1)),
+        (r"\b(last week|semana passada)\b", (now - timedelta(days=7), 4)),
+        (r"\b(last month|mes passado)\b", (now - timedelta(days=30), 7)),
+        (r"\b(last year|ano passado)\b", (now - timedelta(days=365), 30)),
+        (r"\b(recently|recentemente)\b", (now - timedelta(days=14), 14)),
+    ]
+    for pattern, signal in direct_patterns:
+        if re.search(pattern, normalized):
+            return signal
+
+    quantified_patterns = [
+        (r"\b(\d+)\s+days?\s+ago\b", 1),
+        (r"\bha\s+(\d+)\s+dias?\b", 1),
+        (r"\b(\d+)\s+weeks?\s+ago\b", 5),
+        (r"\bha\s+(\d+)\s+semanas?\b", 5),
+        (r"\b(\d+)\s+months?\s+ago\b", 10),
+        (r"\bha\s+(\d+)\s+mes(?:es)?\b", 10),
+        (r"\b(\d+)\s+years?\s+ago\b", 30),
+        (r"\bha\s+(\d+)\s+anos?\b", 30),
+    ]
+    for pattern, tolerance in quantified_patterns:
+        match = re.search(pattern, normalized)
+        if not match:
+            continue
+        quantity = int(match.group(1))
+        if "day" in pattern or "dias" in pattern:
+            return now - timedelta(days=quantity), max(tolerance, min(quantity, 3))
+        if "week" in pattern or "semanas" in pattern:
+            return now - timedelta(days=quantity * 7), tolerance
+        if "month" in pattern or "mes" in pattern:
+            return now - timedelta(days=quantity * 30), tolerance
+        return now - timedelta(days=quantity * 365), tolerance
+
+    return None
+
+
+def _temporal_overlap(query: str, metadata: dict) -> float:
+    signal = _extract_temporal_signal(query)
+    if not signal:
+        return 0.0
+
+    candidate_dt = _parse_metadata_datetime(metadata)
+    if not candidate_dt:
+        return 0.0
+
+    target_dt, tolerance = signal
+    delta_days = abs((candidate_dt.date() - target_dt.date()).days)
+    if delta_days <= tolerance:
+        return 1.0
+
+    extended_window = max(tolerance * 3, tolerance + 2)
+    if delta_days > extended_window:
+        return 0.0
+
+    return max(0.0, 1.0 - ((delta_days - tolerance) / max(extended_window - tolerance, 1)))
 
 
 def _build_query_variants(query: str) -> list[str]:
@@ -262,6 +517,9 @@ def _build_query_variants(query: str) -> list[str]:
     keywords = _extract_keywords(query)
     if keywords:
         add_variant(" ".join(keywords))
+
+    for phrase in _extract_quoted_phrases(query):
+        add_variant(phrase)
 
     return variants
 
@@ -313,12 +571,30 @@ def _semantic_candidates(collection, query: str, where: dict, n_results: int) ->
 
 
 def _rerank_candidates(query: str, candidates: list[dict], n_results: int) -> list[dict]:
-    query_keywords = _extract_keywords(query)
+    query_entities = _extract_notable_entities(query)
+    normalized_entities = {_normalize_text(entity) for entity in query_entities}
+    query_keywords = _extract_keywords(query, excluded_tokens=normalized_entities)
+    query_phrases = _extract_quoted_phrases(query)
 
     for candidate in candidates:
         overlap = _keyword_overlap(query_keywords, candidate["text"])
         fused_distance = candidate["distance"] * (1.0 - DEFAULT_HYBRID_WEIGHT * overlap)
+        phrase_overlap = _quoted_phrase_overlap(query_phrases, candidate["text"])
+        if phrase_overlap > 0:
+            fused_distance = fused_distance * (1.0 - DEFAULT_QUOTED_PHRASE_WEIGHT * phrase_overlap)
+
+        entity_overlap = _entity_overlap(query_entities, candidate["text"])
+        if entity_overlap > 0:
+            fused_distance = fused_distance * (1.0 - DEFAULT_ENTITY_WEIGHT * entity_overlap)
+
+        temporal_overlap = _temporal_overlap(query, candidate["metadata"])
+        if temporal_overlap > 0:
+            fused_distance = fused_distance * (1.0 - DEFAULT_TEMPORAL_WEIGHT * temporal_overlap)
+
         candidate["keyword_overlap"] = round(overlap, 3)
+        candidate["phrase_overlap"] = round(phrase_overlap, 3)
+        candidate["entity_overlap"] = round(entity_overlap, 3)
+        candidate["temporal_overlap"] = round(temporal_overlap, 3)
         candidate["fused_distance"] = fused_distance
 
     candidates.sort(key=lambda item: (item["fused_distance"], item["distance"]))
