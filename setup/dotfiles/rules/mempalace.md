@@ -14,9 +14,26 @@ Carrega esta regra quando o contexto envolver mempalace, diary, AAAK, ou memóri
 Escrita no mempalace (diary_write, add_drawer): usar sempre formato AAAK compacto.
 
 - Campos separados por `|`, compressão com `.`, entity codes, emotion markers
-- Chaves comuns: SESSION, TOPIC, ACT, DONE, STATUS, STATE, NEXT, BLOCKED, NOTES, CAUSE, FIX, ERR, LESSON, HW, SW, CMD, MODIFIED, DEPS, RES
 - Importancia: `★` a `★★★★★`
-- Ex: `SESSION:2026-04-08|TASK:foo.bar|STATUS:done|NOTES:x.y.z|★★★`
+
+### Template de diário
+
+```
+SESSION:<date>|TOPIC:<name>|STATUS:<done|in-progress|blocked>
+CTX:<pedido original do user + contexto relevante>
+FIND:<o que se descobriu / diagnosticou>
+ACT:<acções tomadas, numeradas>
+MODIFIED:<ficheiros + o que mudou em cada um>
+DEC:<decisões duradouras / regras para o futuro>
+USR-FEEDBACK:<reacção do user, se relevante>
+LESSON:<aprendizagens reutilizáveis>
+NEXT:<próximo passo concreto, suficiente para handoff>
+★★★
+```
+
+- **Obrigatórios**: SESSION, TOPIC, STATUS, ACT, ★
+- **Opcionais** (só se aplicável): CTX, FIND, MODIFIED, DEC, USR-FEEDBACK, LESSON, NEXT
+- Não repetir a mesma info em campos diferentes
 
 ## Canais de memória
 

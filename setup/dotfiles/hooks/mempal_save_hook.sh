@@ -1,10 +1,14 @@
 #!/bin/bash
-# MEMPALACE SAVE HOOK — periodic checkpoint every N real user messages
+# MEMPALACE SAVE HOOK — hybrid checkpoint: messages + time
 #
 # Claude Code "Stop" hook. Fires after every assistant response.
-# Every SAVE_INTERVAL external user prompts, blocks the AI and asks it to save.
+# Only triggers a save when BOTH conditions are met since the last save:
+#   - At least SAVE_MSG_INTERVAL real user messages
+#   - At least SAVE_TIME_INTERVAL seconds have passed
 
-SAVE_INTERVAL=10
+SAVE_MSG_INTERVAL=15
+SAVE_TIME_INTERVAL=1800  # 30 minutes
+
 STATE_DIR="$HOME/.mempalace/hook_state"
 mkdir -p "$STATE_DIR"
 
@@ -21,8 +25,7 @@ if [ -f "$ACTIVE_FLAG" ]; then
     exit 0
 fi
 
-# Count only real external user prompts in transcript.
-# Exclude meta/system-ish user records such as local command caveats and tool-result wrappers.
+# Count only real external user prompts in transcript
 if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
     MSG_COUNT=$(python3 -c "
 import json, sys
@@ -66,18 +69,32 @@ else
     MSG_COUNT=0
 fi
 
-# Check last save count
-SAVE_FILE="$STATE_DIR/${SESSION_ID}_savecount"
-LAST_SAVE=$(cat "$SAVE_FILE" 2>/dev/null || echo "0")
+NOW=$(date +%s)
 
-if [ "$((MSG_COUNT - LAST_SAVE))" -ge "$SAVE_INTERVAL" ]; then
+# Read last save state (message count and timestamp)
+SAVE_FILE="$STATE_DIR/${SESSION_ID}_savecount"
+TIME_FILE="$STATE_DIR/${SESSION_ID}_savetime"
+LAST_SAVE_MSG=$(cat "$SAVE_FILE" 2>/dev/null || echo "0")
+LAST_SAVE_TIME=$(cat "$TIME_FILE" 2>/dev/null || echo "0")
+
+# Initialize time on first run
+if [ "$LAST_SAVE_TIME" = "0" ]; then
+    echo "$NOW" > "$TIME_FILE"
+    LAST_SAVE_TIME=$NOW
+fi
+
+MSG_DIFF=$((MSG_COUNT - LAST_SAVE_MSG))
+TIME_DIFF=$((NOW - LAST_SAVE_TIME))
+
+if [ "$MSG_DIFF" -ge "$SAVE_MSG_INTERVAL" ] && [ "$TIME_DIFF" -ge "$SAVE_TIME_INTERVAL" ]; then
     echo "$MSG_COUNT" > "$SAVE_FILE"
+    echo "$NOW" > "$TIME_FILE"
     touch "$ACTIVE_FLAG"
-    echo "[$(date '+%H:%M:%S')] Save triggered at message $MSG_COUNT for session $SESSION_ID" >> "$STATE_DIR/hook.log"
+    echo "[$(date '+%H:%M:%S')] Save triggered at message $MSG_COUNT (${TIME_DIFF}s elapsed) for session $SESSION_ID" >> "$STATE_DIR/hook.log"
     cat << 'HOOKJSON'
 {
   "decision": "block",
-  "reason": "PERIODIC SAVE: Save session state to mempalace. For any active task use this diary structure: TASK: <name> | STATUS: in-progress|done|blocked / DONE: <completed items> / MODIFIED: <files changed> / NEXT: <exact next step — specific enough for another agent to continue> / BLOCKED: <open decisions or blockers> / NOTES: <key decisions and why>. If no active task, save key topics, decisions, and code. Be concise but complete. Another agent may continue this work — write as if handing off to a colleague. After saving, you may stop normally."
+  "reason": "PERIODIC SAVE: Save session state to mempalace diary. Use AAAK format: SESSION:<date>|TOPIC:<name>|STATUS:<done|in-progress|blocked> / CTX:<pedido do user> / FIND:<descobertas> / ACT:<acções numeradas> / MODIFIED:<ficheiros+detalhe> / DEC:<decisões duradouras> / USR-FEEDBACK:<reacção do user> / LESSON:<aprendizagens> / NEXT:<próximo passo para handoff> / ★. Obrigatórios: SESSION,TOPIC,STATUS,ACT,★. Restantes só se aplicável. Be concise. Another agent may continue — write as handoff."
 }
 HOOKJSON
 else
