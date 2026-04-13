@@ -35,7 +35,15 @@ from .version import __version__
 import chromadb
 from .query_sanitizer import sanitize_query
 from .searcher import search_memories
-from .palace_graph import traverse, find_tunnels, graph_stats, create_tunnel, list_tunnels, delete_tunnel, follow_tunnels
+from .palace_graph import (
+    traverse,
+    find_tunnels,
+    graph_stats,
+    create_tunnel,
+    list_tunnels,
+    delete_tunnel,
+    follow_tunnels,
+)
 
 from .knowledge_graph import KnowledgeGraph
 
@@ -519,7 +527,10 @@ def tool_create_tunnel(
     except ValueError as e:
         return {"error": str(e)}
     return create_tunnel(
-        source_wing, source_room, target_wing, target_room,
+        source_wing,
+        source_room,
+        target_wing,
+        target_room,
         label=label,
         source_drawer_id=source_drawer_id,
         target_drawer_id=target_drawer_id,
@@ -1251,8 +1262,14 @@ TOOLS = {
                 "target_wing": {"type": "string", "description": "Wing of the target"},
                 "target_room": {"type": "string", "description": "Room in the target wing"},
                 "label": {"type": "string", "description": "Description of the connection"},
-                "source_drawer_id": {"type": "string", "description": "Optional specific drawer ID"},
-                "target_drawer_id": {"type": "string", "description": "Optional specific drawer ID"},
+                "source_drawer_id": {
+                    "type": "string",
+                    "description": "Optional specific drawer ID",
+                },
+                "target_drawer_id": {
+                    "type": "string",
+                    "description": "Optional specific drawer ID",
+                },
             },
             "required": ["source_wing", "source_room", "target_wing", "target_room"],
         },
@@ -1263,7 +1280,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
-                "wing": {"type": "string", "description": "Filter tunnels by wing (shows tunnels where wing is source or target)"},
+                "wing": {
+                    "type": "string",
+                    "description": "Filter tunnels by wing (shows tunnels where wing is source or target)",
+                },
             },
         },
         "handler": tool_list_tunnels,

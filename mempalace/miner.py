@@ -379,17 +379,17 @@ def chunk_text(content: str, source_file: str) -> list:
 
 
 _ENTITY_REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".mempalace", "known_entities.json")
-_ENTITY_REGISTRY_CACHE: dict = {"mtime": None, "names": frozenset()}
+_ENTITY_REGISTRY_CACHE: dict = {"mtime": None, "names": frozenset(), "raw": {}}
 _ENTITY_EXTRACT_WINDOW = 5000  # chars of content scanned for capitalized words
 _ENTITY_METADATA_LIMIT = 25  # max entities packed into the metadata field
 
 
-def _load_known_entities() -> frozenset:
-    """Load (and cache) the user's known-entity registry by mtime.
-
-    Reads ``~/.mempalace/known_entities.json``. The registry is shaped as
-    ``{"category": ["Name1", "Name2", ...], ...}``. Cached across calls
-    in the same process; invalidated when the file's mtime changes.
+def _refresh_known_entities_cache() -> None:
+    """Reload ``~/.mempalace/known_entities.json`` into the module cache if
+    its mtime changed since the last read. Shared by ``_load_known_entities``
+    (flat set) and ``_load_known_entities_raw`` (category dict), so callers
+    can pick whichever shape they need without duplicating the mtime-gated
+    disk read.
     """
     try:
         mtime = os.path.getmtime(_ENTITY_REGISTRY_PATH)
@@ -397,26 +397,54 @@ def _load_known_entities() -> frozenset:
         if _ENTITY_REGISTRY_CACHE["mtime"] is not None:
             _ENTITY_REGISTRY_CACHE["mtime"] = None
             _ENTITY_REGISTRY_CACHE["names"] = frozenset()
-        return _ENTITY_REGISTRY_CACHE["names"]
+            _ENTITY_REGISTRY_CACHE["raw"] = {}
+        return
 
     if _ENTITY_REGISTRY_CACHE["mtime"] == mtime:
-        return _ENTITY_REGISTRY_CACHE["names"]
+        return
 
     names: set = set()
+    raw: dict = {}
     try:
         import json
 
         with open(_ENTITY_REGISTRY_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        for cat in data.values():
-            if isinstance(cat, list):
-                names.update(str(n) for n in cat if n)
+        if isinstance(data, dict):
+            raw = data
+            for cat in data.values():
+                if isinstance(cat, list):
+                    names.update(str(n) for n in cat if n)
+                elif isinstance(cat, dict):
+                    names.update(str(k) for k in cat.keys() if k)
     except Exception:
         names = set()
+        raw = {}
 
     _ENTITY_REGISTRY_CACHE["mtime"] = mtime
     _ENTITY_REGISTRY_CACHE["names"] = frozenset(names)
+    _ENTITY_REGISTRY_CACHE["raw"] = raw
+
+
+def _load_known_entities() -> frozenset:
+    """Flat set of every known entity name (across all categories).
+
+    Cached by mtime; invalidated when the registry file changes.
+    """
+    _refresh_known_entities_cache()
     return _ENTITY_REGISTRY_CACHE["names"]
+
+
+def _load_known_entities_raw() -> dict:
+    """Full category-dict view of the registry, shape
+    ``{"category": ["Name1", ...], ...}``. Cached by mtime.
+
+    Consumed by modules (e.g., fact_checker) that need to reason about
+    categories rather than a flat name set. Never returns a mutable
+    reference to the cache — callers get a shallow copy.
+    """
+    _refresh_known_entities_cache()
+    return dict(_ENTITY_REGISTRY_CACHE["raw"])
 
 
 def _extract_entities_for_metadata(content: str) -> str:
