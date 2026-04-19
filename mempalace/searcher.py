@@ -56,35 +56,241 @@ _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
 
 STOP_WORDS = {
-    "a", "about", "after", "again", "ago", "ai", "all", "am", "an", "and",
-    "any", "ao", "aos", "are", "as", "at", "aquela", "aquele", "aquilo",
-    "assim", "ate", "até", "be", "because", "been", "before", "by", "buy",
-    "bought", "com", "como", "da", "das", "de", "del", "dela", "dele",
-    "dessa", "desse", "did", "do", "does", "dos", "e", "ela", "ele", "em",
-    "era", "essa", "esse", "esta", "este", "eu", "faz", "fazer", "foi",
-    "for", "from", "gave", "get", "give", "go", "got", "had", "has", "have",
-    "how", "i", "in", "into", "is", "isso", "isto", "it", "its", "last",
-    "made", "make", "me", "meu", "minha", "my", "na", "nas", "no", "nos",
-    "not", "o", "of", "on", "onde", "or", "os", "ou", "para", "pela",
-    "pelas", "pelo", "pelos", "por", "porque", "qual", "quando", "que",
-    "quem", "se", "sem", "ser", "seu", "sua", "suas", "seus", "sobre",
-    "são", "ta", "tal", "tambem", "também", "te", "tem", "that", "the",
-    "their", "there", "this", "to", "tu", "um", "uma", "umas", "uns",
-    "use", "using", "voces", "vocês", "was", "we", "were", "what", "when",
-    "where", "which", "who", "why", "with", "you", "your",
+    "a",
+    "about",
+    "after",
+    "again",
+    "ago",
+    "ai",
+    "all",
+    "am",
+    "an",
+    "and",
+    "any",
+    "ao",
+    "aos",
+    "are",
+    "as",
+    "at",
+    "aquela",
+    "aquele",
+    "aquilo",
+    "assim",
+    "ate",
+    "até",
+    "be",
+    "because",
+    "been",
+    "before",
+    "by",
+    "buy",
+    "bought",
+    "com",
+    "como",
+    "da",
+    "das",
+    "de",
+    "del",
+    "dela",
+    "dele",
+    "dessa",
+    "desse",
+    "did",
+    "do",
+    "does",
+    "dos",
+    "e",
+    "ela",
+    "ele",
+    "em",
+    "era",
+    "essa",
+    "esse",
+    "esta",
+    "este",
+    "eu",
+    "faz",
+    "fazer",
+    "foi",
+    "for",
+    "from",
+    "gave",
+    "get",
+    "give",
+    "go",
+    "got",
+    "had",
+    "has",
+    "have",
+    "how",
+    "i",
+    "in",
+    "into",
+    "is",
+    "isso",
+    "isto",
+    "it",
+    "its",
+    "last",
+    "made",
+    "make",
+    "me",
+    "meu",
+    "minha",
+    "my",
+    "na",
+    "nas",
+    "no",
+    "nos",
+    "not",
+    "o",
+    "of",
+    "on",
+    "onde",
+    "or",
+    "os",
+    "ou",
+    "para",
+    "pela",
+    "pelas",
+    "pelo",
+    "pelos",
+    "por",
+    "porque",
+    "qual",
+    "quando",
+    "que",
+    "quem",
+    "se",
+    "sem",
+    "ser",
+    "seu",
+    "sua",
+    "suas",
+    "seus",
+    "sobre",
+    "são",
+    "ta",
+    "tal",
+    "tambem",
+    "também",
+    "te",
+    "tem",
+    "that",
+    "the",
+    "their",
+    "there",
+    "this",
+    "to",
+    "tu",
+    "um",
+    "uma",
+    "umas",
+    "uns",
+    "use",
+    "using",
+    "voces",
+    "vocês",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "you",
+    "your",
 }
 
 NOTABLE_ENTITY_WORDS = {
-    "And", "Ao", "Aos", "As", "At", "Can", "Com", "Como", "Could", "Da",
-    "Das", "De", "Did", "Do", "Does", "Dos", "E", "Ela", "Ele", "Em",
-    "Esta", "Este", "For", "From", "Ha", "How", "I", "In", "Is", "Isto",
-    "It", "Its", "Just", "Last", "May", "Monday", "More", "My", "Na",
-    "Nas", "No", "Nos", "November", "O", "October", "On", "Onde", "Os",
-    "Our", "Para", "Pela", "Pelas", "Pelo", "Pelos", "Por", "Previously",
-    "Qual", "Quando", "Que", "Quem", "Recently", "Saturday", "September",
-    "Se", "Sem", "Should", "Sunday", "That", "The", "Their", "This",
-    "Thursday", "To", "Tuesday", "Wednesday", "What", "When", "Where",
-    "Which", "Who", "Why", "Will", "With", "Would", "You",
+    "And",
+    "Ao",
+    "Aos",
+    "As",
+    "At",
+    "Can",
+    "Com",
+    "Como",
+    "Could",
+    "Da",
+    "Das",
+    "De",
+    "Did",
+    "Do",
+    "Does",
+    "Dos",
+    "E",
+    "Ela",
+    "Ele",
+    "Em",
+    "Esta",
+    "Este",
+    "For",
+    "From",
+    "Ha",
+    "How",
+    "I",
+    "In",
+    "Is",
+    "Isto",
+    "It",
+    "Its",
+    "Just",
+    "Last",
+    "May",
+    "Monday",
+    "More",
+    "My",
+    "Na",
+    "Nas",
+    "No",
+    "Nos",
+    "November",
+    "O",
+    "October",
+    "On",
+    "Onde",
+    "Os",
+    "Our",
+    "Para",
+    "Pela",
+    "Pelas",
+    "Pelo",
+    "Pelos",
+    "Por",
+    "Previously",
+    "Qual",
+    "Quando",
+    "Que",
+    "Quem",
+    "Recently",
+    "Saturday",
+    "September",
+    "Se",
+    "Sem",
+    "Should",
+    "Sunday",
+    "That",
+    "The",
+    "Their",
+    "This",
+    "Thursday",
+    "To",
+    "Tuesday",
+    "Wednesday",
+    "What",
+    "When",
+    "Where",
+    "Which",
+    "Who",
+    "Why",
+    "Will",
+    "With",
+    "Would",
+    "You",
 }
 
 
@@ -93,6 +299,7 @@ class SearchError(Exception):
 
 
 # ── Tokenization / normalization ───────────────────────────────────────
+
 
 def _first_or_empty(results: dict, key: str) -> list:
     """Return the first inner list of a ChromaDB query result, or []."""
@@ -172,15 +379,14 @@ def _extract_notable_entities(text: str) -> list:
 
 # ── Overlap scores ─────────────────────────────────────────────────────
 
+
 def _token_match_score(query_token: str, doc_token: str) -> float:
     """Exact / prefix (≥5) / fuzzy (SequenceMatcher ratio ≥ 0.90) match."""
     if query_token == doc_token:
         return 1.0
 
     min_len = min(len(query_token), len(doc_token))
-    if min_len >= 5 and (
-        query_token.startswith(doc_token) or doc_token.startswith(query_token)
-    ):
+    if min_len >= 5 and (query_token.startswith(doc_token) or doc_token.startswith(query_token)):
         return DEFAULT_PREFIX_MATCH_WEIGHT
 
     if min_len >= 5 and query_token[:5] == doc_token[:5]:
@@ -252,6 +458,7 @@ def _distance_to_similarity(distance: float) -> float:
 
 # ── BM25 (Okapi, corpus-relative IDF over candidate set) ───────────────
 
+
 def _bm25_scores(
     query: str,
     documents: list,
@@ -280,10 +487,7 @@ def _bm25_scores(
         for term in seen:
             df[term] += 1
 
-    idf = {
-        term: math.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1)
-        for term in query_terms
-    }
+    idf = {term: math.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1) for term in query_terms}
 
     scores = []
     for toks, dl in zip(tokenized, doc_lens):
@@ -304,6 +508,7 @@ def _bm25_scores(
 
 
 # ── Temporal signals (PT+EN) ───────────────────────────────────────────
+
 
 def _parse_metadata_datetime(metadata: dict):
     raw_date = metadata.get("date")
@@ -410,6 +615,7 @@ def _temporal_overlap(query: str, metadata: dict) -> float:
 
 # ── Query expansion ────────────────────────────────────────────────────
 
+
 def _build_query_variants(query: str) -> list:
     """Produce distinct query strings (original, normalized, keywords-only,
     quoted phrases) to expand recall during semantic retrieval."""
@@ -452,6 +658,7 @@ def build_where_filter(wing: str = None, room: str = None) -> dict:
 
 
 # ── Closet helpers (upstream) ──────────────────────────────────────────
+
 
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet doc."""
@@ -604,9 +811,7 @@ def _hybrid_rank(
     docs = [r.get("text", "") for r in results]
     bm25_raw = _bm25_scores(query, docs)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
-    bm25_norm = (
-        [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
-    )
+    bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
 
     scored = []
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
@@ -620,6 +825,7 @@ def _hybrid_rank(
 
 
 # ── Retrieval ──────────────────────────────────────────────────────────
+
 
 def _semantic_candidates(collection, query: str, where: dict, n_results: int) -> list:
     """Run multiple query variants; merge per-id with minimum distance."""
@@ -676,9 +882,7 @@ def _rerank_candidates(
     docs_for_bm25 = [c["text"] for c in candidates]
     bm25_raw = _bm25_scores(query, docs_for_bm25)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
-    bm25_norm = (
-        [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
-    )
+    bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
 
     for i, c in enumerate(candidates):
         kw = _keyword_overlap(query_keywords, c["text"])
@@ -720,15 +924,14 @@ def _rerank_candidates(
         c["fused_distance"] = fused
 
         vec_sim = max(0.0, 1.0 - fused)
-        c["_sort_score"] = (
-            DEFAULT_VECTOR_WEIGHT * vec_sim + DEFAULT_BM25_WEIGHT * bm25_norm[i]
-        )
+        c["_sort_score"] = DEFAULT_VECTOR_WEIGHT * vec_sim + DEFAULT_BM25_WEIGHT * bm25_norm[i]
 
     candidates.sort(key=lambda c: (-c["_sort_score"], c["fused_distance"]))
     return candidates[:n_results]
 
 
 # ── Public API ─────────────────────────────────────────────────────────
+
 
 def _run_search(
     query: str,
@@ -820,9 +1023,7 @@ def _run_search(
 
         if c["matched_via"] == "drawer+closet" and src_full:
             try:
-                expanded = _drawer_grep_expand(
-                    drawers_col, query, c["text"], meta, radius=1
-                )
+                expanded = _drawer_grep_expand(drawers_col, query, c["text"], meta, radius=1)
                 if expanded and expanded.get("text"):
                     hit["text"] = expanded["text"]
                     hit["drawer_index"] = expanded.get("drawer_index")
@@ -848,9 +1049,7 @@ def search(
     n_results: int = 5,
 ):
     """CLI search — prints verbatim drawer content."""
-    result = _run_search(
-        query, palace_path, wing=wing, room=room, n_results=n_results
-    )
+    result = _run_search(query, palace_path, wing=wing, room=room, n_results=n_results)
     if "error" in result:
         print(f"\n  {result['error']} at {palace_path}")
         if hint := result.get("hint"):
