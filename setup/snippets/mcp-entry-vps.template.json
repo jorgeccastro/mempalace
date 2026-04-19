@@ -1,0 +1,12 @@
+{
+  "type": "stdio",
+  "command": "ssh",
+  "args": [
+    "-o", "BatchMode=yes",
+    "-o", "ServerAliveInterval=30",
+    "__VPS_USER__@__VPS_HOST__",
+    "__VPS_PYTHON__",
+    "-m", "mempalace.mcp_server"
+  ],
+  "env": {}
+}
