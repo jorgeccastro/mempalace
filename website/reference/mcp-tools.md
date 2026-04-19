@@ -347,6 +347,18 @@ Read recent diary entries.
 
 ---
 
+### `mempalace_diary_delete`
+
+Delete a diary entry by `entry_id`. Admin tool — no caller auth (MCP has no transport-level identity). Use `mempalace_diary_read` first to locate the `entry_id` to remove.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `entry_id` | string | **Yes** | The `entry_id` returned by `mempalace_diary_read` |
+
+**Returns:** `{ success: true, deleted_entry_id }`
+
+---
+
 ## System Tools
 
 ### `mempalace_hook_settings`
