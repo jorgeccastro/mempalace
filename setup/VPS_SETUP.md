@@ -1,5 +1,7 @@
 # mempalace — shared VPS palace
 
+> 🇵🇹 Português: [`VPS_SETUP.pt.md`](VPS_SETUP.pt.md)
+
 Run a single mempalace palace on a VPS and have multiple clients
 (Claude Code, Codex, etc. across different machines) talk to it via SSH.
 

@@ -1,5 +1,7 @@
 # Mempalace Setup
 
+> 🇵🇹 Português: [`README.pt.md`](README.pt.md)
+
 Bootstrap scripts + dotfiles to reproduce the full mempalace + Claude Code
 integration on another machine.
 
@@ -52,7 +54,7 @@ Safe to re-run. Existing files are backed up with suffix `.bak.YYYYMMDD-HHMMSS` 
 
 ## B. Shared VPS palace
 
-Run a single mempalace palace on a VPS, connect multiple clients to it via SSH stdio. See **[`VPS_SETUP.md`](VPS_SETUP.md)** for architecture, prerequisites, and full walkthrough.
+Run a single mempalace palace on a VPS, connect multiple clients to it via SSH stdio. See **[`VPS_SETUP.md`](VPS_SETUP.md)** (🇵🇹 [`VPS_SETUP.pt.md`](VPS_SETUP.pt.md)) for architecture, prerequisites, and full walkthrough.
 
 Quick flow:
 
