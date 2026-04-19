@@ -240,8 +240,14 @@ def _entity_overlap(entities: list, doc_text: str) -> float:
 
 
 def _distance_to_similarity(distance: float) -> float:
-    """Cosine-aware similarity bounded to [0, 1]."""
-    return round(max(0.0, min(1.0, 1.0 - distance)), 3)
+    """Monotonic distance→similarity mapping, bounded to [0, 1].
+
+    Uses ``1 / (1 + d)`` so it works for either L2 (d ∈ [0, ∞)) or cosine
+    (d ∈ [0, 2]) palaces. Closet boost can drive effective distance below
+    zero, so we clamp to [0, 1].
+    """
+    d = max(distance, 0.0)
+    return round(min(1.0, 1.0 / (1.0 + d)), 3)
 
 
 # ── BM25 (Okapi, corpus-relative IDF over candidate set) ───────────────
@@ -462,10 +468,68 @@ def _expand_with_neighbors(
     drawers_col,
     matched_doc: str,
     matched_meta: dict,
-    query: str,
     radius: int = 1,
 ):
-    """For a closet-boosted hit, return best-keyword chunk ± neighbors."""
+    """Upstream-compatible: expand around the matched ``chunk_index`` in the
+    same source_file. Used by callers that already know which chunk matched.
+    """
+    src = matched_meta.get("source_file")
+    chunk_idx = matched_meta.get("chunk_index")
+    if not src or not isinstance(chunk_idx, int):
+        return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
+
+    target_indexes = [chunk_idx + offset for offset in range(-radius, radius + 1)]
+    try:
+        neighbors = drawers_col.get(
+            where={
+                "$and": [
+                    {"source_file": src},
+                    {"chunk_index": {"$in": target_indexes}},
+                ]
+            },
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
+
+    indexed_docs = []
+    for doc, meta in zip(neighbors.get("documents") or [], neighbors.get("metadatas") or []):
+        ci = meta.get("chunk_index")
+        if isinstance(ci, int):
+            indexed_docs.append((ci, doc))
+    indexed_docs.sort(key=lambda pair: pair[0])
+
+    if not indexed_docs:
+        combined_text = matched_doc
+    else:
+        combined_text = "\n\n".join(doc for _, doc in indexed_docs)
+
+    total_drawers = None
+    try:
+        all_meta = drawers_col.get(where={"source_file": src}, include=["metadatas"])
+        ids = all_meta.get("ids") or []
+        total_drawers = len(ids) if ids else None
+    except Exception:
+        pass
+
+    return {
+        "text": combined_text,
+        "drawer_index": chunk_idx,
+        "total_drawers": total_drawers,
+    }
+
+
+def _drawer_grep_expand(
+    drawers_col,
+    query: str,
+    matched_doc: str,
+    matched_meta: dict,
+    radius: int = 1,
+):
+    """Closet-boost companion: find the best-keyword chunk in the source_file
+    and return it plus ± neighbors. Closets say *which source* is relevant;
+    vector may have landed on the wrong chunk within it — grep picks the right
+    one."""
     src = matched_meta.get("source_file")
     if not src:
         return {"text": matched_doc, "drawer_index": None, "total_drawers": None}
@@ -519,6 +583,40 @@ def _expand_with_neighbors(
         "drawer_index": best_idx,
         "total_drawers": len(ordered_docs),
     }
+
+
+def _hybrid_rank(
+    results: list,
+    query: str,
+    vector_weight: float = 0.6,
+    bm25_weight: float = 0.4,
+) -> list:
+    """Upstream-compatible: rerank a list of result dicts by a convex
+    combination of absolute vector similarity ``max(0, 1 - distance)`` and
+    min-max-normalized BM25 over the candidate set.
+
+    Mutates each result dict to add ``bm25_score`` and reorders the list
+    in place. Returns the same list for convenience.
+    """
+    if not results:
+        return results
+
+    docs = [r.get("text", "") for r in results]
+    bm25_raw = _bm25_scores(query, docs)
+    max_bm25 = max(bm25_raw) if bm25_raw else 0.0
+    bm25_norm = (
+        [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
+    )
+
+    scored = []
+    for r, raw, norm in zip(results, bm25_raw, bm25_norm):
+        vec_sim = max(0.0, 1.0 - r.get("distance", 1.0))
+        r["bm25_score"] = round(raw, 3)
+        scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    results[:] = [r for _, r in scored]
+    return results
 
 
 # ── Retrieval ──────────────────────────────────────────────────────────
@@ -722,8 +820,8 @@ def _run_search(
 
         if c["matched_via"] == "drawer+closet" and src_full:
             try:
-                expanded = _expand_with_neighbors(
-                    drawers_col, c["text"], meta, query, radius=1
+                expanded = _drawer_grep_expand(
+                    drawers_col, query, c["text"], meta, radius=1
                 )
                 if expanded and expanded.get("text"):
                     hit["text"] = expanded["text"]
