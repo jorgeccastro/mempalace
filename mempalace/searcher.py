@@ -301,9 +301,16 @@ class SearchError(Exception):
 # ── Tokenization / normalization ───────────────────────────────────────
 
 
-def _first_or_empty(results: dict, key: str) -> list:
-    """Return the first inner list of a ChromaDB query result, or []."""
-    outer = results.get(key)
+def _first_or_empty(results, key: str) -> list:
+    """Return the first inner list of a query result field, or [].
+
+    Accepts both the typed :class:`QueryResult` (attribute access) and the
+    pre-typed chroma dict shape; this polymorphism is retained so test mocks
+    still work and callers mid-migration do not crash. Preserves the empty-
+    collection semantics from issue #195: when no queries returned hits, the
+    outer list may be empty and indexing ``[0]`` would raise.
+    """
+    outer = getattr(results, key, None) if not isinstance(results, dict) else results.get(key)
     if not outer:
         return []
     return outer[0] or []
