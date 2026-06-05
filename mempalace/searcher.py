@@ -1326,6 +1326,8 @@ def search_memories(
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
+    candidate_strategy: str = "vector",  # jor-shim v3.3.5-compat: accept-and-ignore (union nao usado via MCP)
+    collection_name: str = None,  # jor-shim v3.3.5-compat: accept-and-ignore (palace single-collection)
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
