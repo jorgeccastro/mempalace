@@ -1064,7 +1064,54 @@ def _rerank_candidates(
         c["_sort_score"] = DEFAULT_VECTOR_WEIGHT * vec_sim + DEFAULT_BM25_WEIGHT * bm25_norm[i]
 
     candidates.sort(key=lambda c: (-c["_sort_score"], c["fused_distance"]))
-    return candidates[:n_results]
+    # Collapse chunk-rows of the same logical drawer to their best-scoring chunk so a
+    # single verbose (chunked) drawer cannot occupy multiple result slots. Only chunk
+    # groups collapse (by parent_drawer_id / stripped _chunk_ id); distinct non-chunked
+    # drawers are never merged.
+    deduped = []
+    seen_logical = set()
+    for c in candidates:
+        m = c.get("metadata") or {}
+        cid = str(c.get("id") or "")
+        if m.get("parent_drawer_id"):
+            logical = m["parent_drawer_id"]
+        elif "_chunk_" in cid:
+            logical = cid.rsplit("_chunk_", 1)[0]
+        else:
+            logical = cid
+        if logical in seen_logical:
+            continue
+        seen_logical.add(logical)
+        deduped.append(c)
+        if len(deduped) >= n_results:
+            break
+    return deduped
+
+
+def _reassemble_logical_drawer(drawers_col, parent_id: str):
+    """Join all chunks of a logical drawer (parent_drawer_id == parent_id), ordered by
+    chunk_index, with NO separator — byte-exact match to get_drawer / _logical_chunk_group.
+    Returns {"text", "total_drawers"} or None when no chunk group is found.
+    """
+    try:
+        grp = drawers_col.get(
+            where={"parent_drawer_id": parent_id},
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        return None
+    docs = grp.get("documents") or []
+    metas = grp.get("metadatas") or []
+    if not docs:
+        return None
+    rows = []
+    for d, m in zip(docs, metas):
+        ci = m.get("chunk_index", 0) if isinstance(m, dict) else 0
+        if not isinstance(ci, int):
+            ci = 0
+        rows.append((ci, d or ""))
+    rows.sort(key=lambda r: r[0])
+    return {"text": "".join(d for _, d in rows), "total_drawers": len(rows)}
 
 
 # ── Public API ─────────────────────────────────────────────────────────
@@ -1188,7 +1235,23 @@ def _run_search(
         if c.get("closet_preview"):
             hit["closet_preview"] = c["closet_preview"]
 
-        if c["matched_via"] == "drawer+closet" and src_full:
+        # Reassemble chunked logical drawers to FULL content so search returns the whole
+        # drawer, not an ~800-char fragment. Covers chunked drawers that carry NO
+        # source_file (diary/AAAK entries) which the closet/source_file expansion below
+        # never reached. Byte-exact join, same as get_drawer.
+        cid = str(c.get("id") or "")
+        parent_id = meta.get("parent_drawer_id") or (
+            cid.rsplit("_chunk_", 1)[0] if "_chunk_" in cid else None
+        )
+        if parent_id:
+            try:
+                full = _reassemble_logical_drawer(drawers_col, parent_id)
+                if full and full.get("text"):
+                    hit["text"] = full["text"]
+                    hit["total_drawers"] = full.get("total_drawers")
+            except Exception:
+                pass  # best-effort; fall back to the matched chunk text
+        elif c["matched_via"] == "drawer+closet" and src_full:
             try:
                 expanded = _drawer_grep_expand(drawers_col, query, c["text"], meta, radius=1)
                 if expanded and expanded.get("text"):
@@ -1470,6 +1533,7 @@ def _bm25_only_via_sqlite(
                 # multiple chunks. Stripped before this helper returns.
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
+                "_parent_drawer_id": meta.get("parent_drawer_id"),
             }
         )
 
@@ -1481,9 +1545,25 @@ def _bm25_only_via_sqlite(
         c["bm25_score"] = round(raw, 3)
         c["_score"] = (raw / max_bm25) if max_bm25 > 0 else 0.0
     candidates.sort(key=lambda c: c["_score"], reverse=True)
-    hits = candidates[:n_results]
+    # Collapse chunk-rows of the same logical drawer (parent_drawer_id) to the best-
+    # scoring chunk so one chunked drawer can't fill multiple slots. (This emergency
+    # vector-disabled path returns the matched chunk's text, not a reassembled full
+    # drawer — callers hydrate via get_drawer(parent_drawer_id) if they need it.)
+    deduped = []
+    seen_logical = set()
+    for c in candidates:
+        pid = c.get("_parent_drawer_id")
+        key = pid if pid else id(c)
+        if key in seen_logical:
+            continue
+        seen_logical.add(key)
+        deduped.append(c)
+        if len(deduped) >= n_results:
+            break
+    hits = deduped
     for h in hits:
         h.pop("_score", None)
+        h.pop("_parent_drawer_id", None)
         # Strip internal fields by default so the public BM25-only fallback
         # response stays clean. Callers that need chunk-precise dedup
         # (notably the union-merge path) opt in via _include_internal.

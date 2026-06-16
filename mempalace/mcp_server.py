@@ -1074,12 +1074,24 @@ def tool_status():
     }
     try:
         all_meta = _get_cached_metadata(col)
+        # Count LOGICAL drawers: chunk-rows sharing a parent_drawer_id collapse to one,
+        # so total/per-wing/room reflect drawers, not physical chunk rows (a chunked
+        # palace would otherwise inflate ~4x on every wake-up).
+        seen_parents = set()
+        logical = 0
         for m in all_meta:
             m = m or {}
+            pid = m.get("parent_drawer_id")
+            if pid:
+                if pid in seen_parents:
+                    continue
+                seen_parents.add(pid)
+            logical += 1
             w = m.get("wing", "unknown")
             r = m.get("room", "unknown")
             wings[w] = wings.get(w, 0) + 1
             rooms[r] = rooms.get(r, 0) + 1
+        result["total_drawers"] = logical
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
