@@ -27,6 +27,26 @@ from pathlib import Path
 
 from .palace import get_closets_collection, get_collection
 
+try:
+    from .backends import (
+        BackendError,
+        BackendMismatchError,
+        CollectionNotInitializedError,
+        PalaceNotFoundError,
+    )
+except Exception:  # pragma: no cover - backends layer always present in v3.4.1+
+    class BackendError(Exception):
+        pass
+
+    class BackendMismatchError(BackendError):
+        pass
+
+    class CollectionNotInitializedError(BackendError):
+        pass
+
+    class PalaceNotFoundError(BackendError):
+        pass
+
 logger = logging.getLogger("mempalace_mcp")
 
 
@@ -463,15 +483,68 @@ def _entity_overlap(entities: list, doc_text: str) -> float:
     return hits / len(entities)
 
 
-def _distance_to_similarity(distance: float) -> float:
-    """Monotonic distance→similarity mapping, bounded to [0, 1].
+def _distance_to_similarity(distance, metric: str = "cosine") -> float:
+    """Map a backend-reported ``distance`` to a [0, 1]-ish similarity.
 
-    Uses ``1 / (1 + d)`` so it works for either L2 (d ∈ [0, ∞)) or cosine
-    (d ∈ [0, 2]) palaces. Closet boost can drive effective distance below
-    zero, so we clamp to [0, 1].
+    Metric-aware (matches upstream v3.4.1 + the RFC-001 backend contract:
+    the ``distances`` field is always *lower = closer*):
+
+    * ``l2``     — Euclidean ∈ [0, ∞):    ``1 / (1 + d)``. This palace's
+                   ``mempalace_drawers`` collection is L2 (hnsw.space=l2),
+                   so this is the active branch — and it equals the fork's
+                   historical ``1 / (1 + d)``, preserving reported scores.
+    * ``cosine`` — distance ∈ [0, 2]:     ``max(0, 1 - d)``.
+    * ``ip``     — inner-product distance: logistic ``1 / (1 + e^d)``.
+
+    ``None`` (vector-unknown / BM25-only candidate) maps to 0.0. A closet
+    boost can drive effective distance below zero, so the l2 branch clamps.
     """
-    d = max(distance, 0.0)
-    return round(min(1.0, 1.0 / (1.0 + d)), 3)
+    if distance is None:
+        return 0.0
+    m = (metric or "cosine").lower()
+    if m == "l2":
+        return round(min(1.0, 1.0 / (1.0 + max(0.0, distance))), 3)
+    if m == "ip":
+        return round(1.0 / (1.0 + math.exp(min(60.0, distance))), 3)
+    return round(max(0.0, 1.0 - distance), 3)
+
+
+def _metric_for_collection(col) -> str:
+    """Resolve a collection's declared distance metric (``l2`` / ``cosine`` / ``ip``).
+
+    Tries, in order: the RFC-001 ``distance_metric`` attribute (backends),
+    the legacy ``hnsw:space`` in ``metadata``, then the chroma 1.5.x
+    ``configuration_json`` ``hnsw.space``. Falls back to ``cosine``.
+
+    Critical for this palace: ``mempalace_drawers`` declares ``hnsw.space=l2``
+    *only* in ``configuration_json`` (its ``metadata`` is ``None``). Reading
+    just the attribute or metadata would default to cosine and zero every
+    semantic score (``max(0, 1-d)=0`` for the L2 distances ~1.4 this palace
+    produces). Upstream's resolver alone would mis-detect this collection.
+    """
+    metric = None
+    try:
+        metric = getattr(col, "distance_metric", None)
+    except Exception:
+        metric = None
+    if not metric:
+        try:
+            meta = getattr(col, "metadata", None)
+            if isinstance(meta, dict):
+                metric = meta.get("hnsw:space")
+        except Exception:
+            pass
+    if not metric:
+        try:
+            cfg = getattr(col, "configuration_json", None)
+            if cfg is None and hasattr(col, "_model"):
+                cfg = getattr(col._model, "configuration_json", None)
+            if isinstance(cfg, dict):
+                metric = (cfg.get("hnsw") or {}).get("space")
+        except Exception:
+            pass
+    metric = str(metric or "cosine").lower()
+    return metric if metric in ("cosine", "l2", "ip") else "cosine"
 
 
 # ── BM25 (Okapi, corpus-relative IDF over candidate set) ───────────────
@@ -711,6 +784,17 @@ def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     return list(seen.keys())
 
 
+def _scoped_source_filter(source_file: str, parent_drawer_id=None) -> dict:
+    """Scope a query to ``source_file``, additionally narrowed by
+    ``parent_drawer_id`` when present (#1580 — two oversized chunked writes
+    can share a ``source_file`` but each carries its own ``parent_drawer_id``
+    group; the bare file filter would stitch chunks across both groups).
+    """
+    if parent_drawer_id:
+        return {"$and": [{"source_file": source_file}, {"parent_drawer_id": parent_drawer_id}]}
+    return {"source_file": source_file}
+
+
 def _expand_with_neighbors(
     drawers_col,
     matched_doc: str,
@@ -719,21 +803,25 @@ def _expand_with_neighbors(
 ):
     """Upstream-compatible: expand around the matched ``chunk_index`` in the
     same source_file. Used by callers that already know which chunk matched.
+    Narrows by ``parent_drawer_id`` when present so chunks from unrelated
+    logical drawers sharing a ``source_file`` do not stitch (#1580).
     """
     src = matched_meta.get("source_file")
     chunk_idx = matched_meta.get("chunk_index")
     if not src or not isinstance(chunk_idx, int):
         return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
 
+    parent_id = matched_meta.get("parent_drawer_id")
     target_indexes = [chunk_idx + offset for offset in range(-radius, radius + 1)]
+    neighbor_clauses = [
+        {"source_file": src},
+        {"chunk_index": {"$in": target_indexes}},
+    ]
+    if parent_id:
+        neighbor_clauses.append({"parent_drawer_id": parent_id})
     try:
         neighbors = drawers_col.get(
-            where={
-                "$and": [
-                    {"source_file": src},
-                    {"chunk_index": {"$in": target_indexes}},
-                ]
-            },
+            where={"$and": neighbor_clauses},
             include=["documents", "metadatas"],
         )
     except Exception:
@@ -753,7 +841,9 @@ def _expand_with_neighbors(
 
     total_drawers = None
     try:
-        all_meta = drawers_col.get(where={"source_file": src}, include=["metadatas"])
+        all_meta = drawers_col.get(
+            where=_scoped_source_filter(src, parent_id), include=["metadatas"]
+        )
         ids = all_meta.get("ids") or []
         total_drawers = len(ids) if ids else None
     except Exception:
@@ -781,9 +871,10 @@ def _drawer_grep_expand(
     if not src:
         return {"text": matched_doc, "drawer_index": None, "total_drawers": None}
 
+    parent_id = matched_meta.get("parent_drawer_id")
     try:
         source_drawers = drawers_col.get(
-            where={"source_file": src},
+            where=_scoped_source_filter(src, parent_id),
             include=["documents", "metadatas"],
         )
     except Exception:
@@ -837,13 +928,19 @@ def _hybrid_rank(
     query: str,
     vector_weight: float = 0.6,
     bm25_weight: float = 0.4,
+    metric: str = "cosine",
 ) -> list:
-    """Upstream-compatible: rerank a list of result dicts by a convex
-    combination of absolute vector similarity ``max(0, 1 - distance)`` and
-    min-max-normalized BM25 over the candidate set.
+    """Re-rank ``results`` by a convex combination of vector similarity + BM25.
 
-    Mutates each result dict to add ``bm25_score`` and reorders the list
-    in place. Returns the same list for convenience.
+    Metric-aware (matches upstream v3.4.1): vector similarity is derived from
+    each candidate's ``distance`` via :func:`_distance_to_similarity` in the
+    collection's declared ``metric``. Candidates with ``distance=None``
+    (BM25-only) score on their BM25 contribution alone. BM25 is min-max
+    normalized within the candidate set so the weights are commensurable.
+
+    Mutates each result dict to add ``bm25_score`` and reorders in place.
+    (Not used by the fork's tuned ``_rerank_candidates`` pipeline; kept
+    metric-correct for the auxiliary/backend callers that import it.)
     """
     if not results:
         return results
@@ -855,7 +952,7 @@ def _hybrid_rank(
 
     scored = []
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
-        vec_sim = max(0.0, 1.0 - r.get("distance", 1.0))
+        vec_sim = _distance_to_similarity(r.get("distance"), metric)
         r["bm25_score"] = round(raw, 3)
         scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
 
@@ -985,6 +1082,31 @@ def _run_search(
     """Core search — returns a normalized dict shared by CLI and MCP paths."""
     try:
         drawers_col = get_collection(palace_path, create=False)
+    except BackendMismatchError as e:
+        return {
+            "error": "Backend mismatch",
+            "details": str(e),
+            "hint": "Select the matching backend or use a fresh palace directory.",
+        }
+    except KeyError as e:
+        return {
+            "error": "Unknown backend",
+            "details": str(e),
+            "hint": "Check MEMPALACE_BACKEND or the configured backend name.",
+        }
+    except (CollectionNotInitializedError, PalaceNotFoundError) as e:
+        logger.error("No palace found at %s: %s", palace_path, e)
+        return {
+            "error": "No palace found",
+            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
+        }
+    except BackendError as e:
+        logger.error("Backend error opening palace at %s: %s", palace_path, e)
+        return {
+            "error": "Backend error",
+            "details": str(e),
+            "hint": "Check the selected backend configuration and availability.",
+        }
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
         return {
@@ -995,6 +1117,7 @@ def _run_search(
     if warn_legacy_metric:
         _warn_if_legacy_metric(drawers_col)
 
+    metric = _metric_for_collection(drawers_col)
     where = _build_where_filter(wing=wing, room=room)
 
     try:
@@ -1051,7 +1174,7 @@ def _run_search(
             "room": meta.get("room", "unknown"),
             "source_file": Path(src_full).name if src_full else "?",
             "created_at": created_at,
-            "similarity": _distance_to_similarity(c["fused_distance"]),
+            "similarity": _distance_to_similarity(c["fused_distance"], metric),
             "distance": round(c["distance"], 4),
             "effective_distance": round(c["fused_distance"], 4),
             "closet_boost": c["closet_boost"],
@@ -1082,6 +1205,7 @@ def _run_search(
         "filters": {"wing": wing, "room": room},
         "total_before_filter": len(candidates),
         "results": hits,
+        "metric": metric,
     }
 
 
@@ -1112,6 +1236,7 @@ def search(
         print(f'\n  No results found for: "{query}"')
         return
 
+    metric = result.get("metric", "cosine")
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
     if wing:
@@ -1127,8 +1252,7 @@ def search(
         if bm25 is None:
             print(f"      Match:  {hit['similarity']}")
         else:
-            cosine = max(0.0, 1.0 - float(hit.get("distance", 1.0)))
-            print(f"      Match:  {hit['similarity']}  cosine={round(cosine, 3)}  bm25={bm25}")
+            print(f"      Match:  {metric}_sim={hit['similarity']}  bm25={bm25}")
         print()
         for line in (hit.get("text") or "").strip().split("\n"):
             print(f"      {line}")
@@ -1145,6 +1269,8 @@ def _bm25_only_via_sqlite(
     room: str = None,
     n_results: int = 5,
     max_candidates: int = 500,
+    _include_internal: bool = False,
+    collection_name: str = None,
 ) -> dict:
     """BM25-only search reading drawers directly from chroma.sqlite3.
 
@@ -1168,6 +1294,35 @@ def _bm25_only_via_sqlite(
             "error": "No palace found",
             "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
         }
+    if collection_name is None:
+        from .config import get_configured_collection_name
+
+        collection_name = get_configured_collection_name()
+
+    def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
+        clauses = []
+        params = []
+        for key, value in (("wing", wing), ("room", room)):
+            if not value:
+                continue
+            clauses.append(
+                f"""
+                AND EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata mf
+                    WHERE mf.id = {row_id_expr}
+                      AND mf.key = ?
+                      AND COALESCE(
+                        mf.string_value,
+                        CAST(mf.int_value AS TEXT),
+                        CAST(mf.float_value AS TEXT),
+                        CAST(mf.bool_value AS TEXT)
+                      ) = ?
+                )
+                """
+            )
+            params.extend([key, value])
+        return "".join(clauses), params
 
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -1179,45 +1334,57 @@ def _bm25_only_via_sqlite(
         # shorter than 3 chars (trigram tokenizer can't match them).
         tokens = [t for t in _tokenize(query) if len(t) >= 3]
         candidate_ids: list[int] = []
+        use_recency_fallback = not tokens
         if tokens:
             fts_query = " OR ".join(tokens)
+            filter_sql, filter_params = _metadata_filter_sql("embedding_fulltext_search.rowid")
             try:
                 rows = conn.execute(
-                    """
-                    SELECT rowid
+                    f"""
+                    SELECT embedding_fulltext_search.rowid
                     FROM embedding_fulltext_search
+                    JOIN embeddings e ON e.id = embedding_fulltext_search.rowid
+                    JOIN segments s ON e.segment_id = s.id
+                    JOIN collections c ON s.collection = c.id
                     WHERE embedding_fulltext_search MATCH ?
+                      AND c.name = ?
+                    {filter_sql}
                     LIMIT ?
                     """,
-                    (fts_query, max_candidates),
+                    (fts_query, collection_name, *filter_params, max_candidates),
                 ).fetchall()
                 candidate_ids = [r[0] for r in rows]
             except sqlite3.Error:
                 # FTS5 tokenizer mismatch or syntax error — fall through
                 # to the recency-window selector below.
                 logger.debug("FTS5 MATCH failed; using recency fallback", exc_info=True)
+                use_recency_fallback = True
 
-        if not candidate_ids:
-            # No FTS hits (or no usable tokens) — pull the most recent
-            # rows for the drawers segment so we can BM25-rank something
-            # rather than return empty-handed. Wrapped in try/except
-            # because the schema may differ on legacy palaces (older
-            # chromadb without ``created_at``, missing ``segments``
-            # rows after partial restore, etc.); on schema mismatch we
-            # fall back to ordering by primary-key id and finally to an
-            # empty result rather than letting search raise.
+        if not candidate_ids and use_recency_fallback:
+            # No usable FTS tokens, or FTS itself failed — pull the most
+            # recent rows for the drawers segment so we can BM25-rank
+            # something rather than return empty-handed. A clean FTS miss
+            # must stay empty, especially after wing/room filtering, because
+            # recency fallback would return unrelated scoped drawers.
+            # Wrapped in try/except because the schema may differ on legacy
+            # palaces (older chromadb without ``created_at``, missing
+            # ``segments`` rows after partial restore, etc.); on schema
+            # mismatch we fall back to ordering by primary-key id and finally
+            # to an empty result rather than letting search raise.
             try:
+                filter_sql, filter_params = _metadata_filter_sql("e.id")
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT e.id
                     FROM embeddings e
                     JOIN segments s ON e.segment_id = s.id
                     JOIN collections c ON s.collection = c.id
-                    WHERE c.name = 'mempalace_drawers'
+                    WHERE c.name = ?
+                    {filter_sql}
                     ORDER BY e.created_at DESC
                     LIMIT ?
                     """,
-                    (max_candidates,),
+                    (collection_name, *filter_params, max_candidates),
                 ).fetchall()
                 candidate_ids = [r[0] for r in rows]
             except sqlite3.Error:
@@ -1226,17 +1393,19 @@ def _bm25_only_via_sqlite(
                     exc_info=True,
                 )
                 try:
+                    filter_sql, filter_params = _metadata_filter_sql("e.id")
                     rows = conn.execute(
-                        """
+                        f"""
                         SELECT e.id
                         FROM embeddings e
                         JOIN segments s ON e.segment_id = s.id
                         JOIN collections c ON s.collection = c.id
-                        WHERE c.name = 'mempalace_drawers'
+                        WHERE c.name = ?
+                        {filter_sql}
                         ORDER BY e.id DESC
                         LIMIT ?
                         """,
-                        (max_candidates,),
+                        (collection_name, *filter_params, max_candidates),
                     ).fetchall()
                     candidate_ids = [r[0] for r in rows]
                 except sqlite3.Error:
@@ -1282,17 +1451,25 @@ def _bm25_only_via_sqlite(
             continue
         if room and meta.get("room") != room:
             continue
+        full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
                 "text": d["text"],
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
-                "source_file": Path(meta.get("source_file", "?") or "?").name,
+                "source_file": Path(full_source).name if full_source else "?",
                 "created_at": meta.get("filed_at", "unknown"),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
                 "distance": None,
                 "matched_via": "bm25_sqlite",
+                # Internal: full path + chunk_index let callers (notably
+                # candidate_strategy="union") dedupe at chunk granularity
+                # rather than basename — two files in different directories
+                # may share a basename, and one source_file is split across
+                # multiple chunks. Stripped before this helper returns.
+                "_source_file_full": full_source,
+                "_chunk_index": meta.get("chunk_index"),
             }
         )
 
@@ -1307,6 +1484,12 @@ def _bm25_only_via_sqlite(
     hits = candidates[:n_results]
     for h in hits:
         h.pop("_score", None)
+        # Strip internal fields by default so the public BM25-only fallback
+        # response stays clean. Callers that need chunk-precise dedup
+        # (notably the union-merge path) opt in via _include_internal.
+        if not _include_internal:
+            h.pop("_source_file_full", None)
+            h.pop("_chunk_index", None)
 
     return {
         "query": query,
@@ -1342,7 +1525,16 @@ def search_memories(
         max_distance: Max cosine distance threshold (0.0 disables).
         vector_disabled: When True, route to the sqlite-only BM25 fallback
             used when the HNSW vector segment is unsafe to load.
+        candidate_strategy: "vector" (default). "union" is accepted for
+            upstream API parity but the fork's variant-expansion pipeline
+            already widens recall, so it behaves as "vector". Unknown values
+            raise ``ValueError`` (validated eagerly, before any branch).
     """
+    if candidate_strategy not in ("vector", "union"):
+        raise ValueError(
+            f"candidate_strategy must be one of ('vector', 'union'), got {candidate_strategy!r}"
+        )
+
     if vector_disabled:
         return _bm25_only_via_sqlite(
             query,
@@ -1360,3 +1552,61 @@ def search_memories(
         n_results=n_results,
         max_distance=max_distance,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Virtual line numbering — read-time grid for drawers (3.3.6, from upstream).
+#
+# Drawers are stored verbatim on disk. The reader applies a line-number grid
+# at read time so any drawer — numbered or not — can be sectioned by a closet
+# pointer like ``→2026-01-18:L55-L72`` without rewriting the corpus. Pure
+# functions, no I/O. Source drawer text is never mutated.
+# See docs/virtual-line-numbering.md for the full design rationale.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# A line is "already numbered" iff it starts with [<digits>].
+_ALREADY_NUMBERED_RE = re.compile(r"^\[\d+\]")
+
+
+def render_with_line_numbers(text: "str | None", start_line: int = 1) -> str:
+    """Prefix each line of ``text`` with ``[N] `` for read-time grid display.
+
+    Lines that already begin with ``[<digits>]`` pass through unchanged,
+    but the counter still advances on them so callers can rely on positional
+    alignment with the original line indices.
+
+    ``None`` is treated as empty string. Pure function.
+    """
+    if not text:
+        return ""
+    out = []
+    for i, line in enumerate(text.split("\n"), start=start_line):
+        if _ALREADY_NUMBERED_RE.match(line):
+            out.append(line)
+        else:
+            out.append(f"[{i}] {line}")
+    return "\n".join(out)
+
+
+def extract_line_range(text: str, line_start: int, line_end: int) -> str:
+    """Return the 1-indexed inclusive slice ``[line_start, line_end]`` rendered with line numbers.
+
+    This is the closet-pointer read path. A pointer like ``→2026-01-18:L55-L72``
+    resolves by opening the day-drawer and calling ``extract_line_range(drawer_text, 55, 72)``.
+    Out-of-bounds ranges are clamped. Invalid ranges return ``""``.
+    """
+    if not text:
+        return ""
+    if line_end < line_start:
+        return ""
+
+    lines = text.split("\n")
+    effective_start = max(1, line_start)
+    effective_end = min(len(lines), line_end)
+
+    if effective_start > effective_end:
+        return ""
+
+    section = "\n".join(lines[effective_start - 1 : effective_end])
+    return render_with_line_numbers(section, start_line=effective_start)

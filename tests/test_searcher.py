@@ -179,6 +179,19 @@ class TestSearchMemories:
             result = search_memories(
                 "guest access shared folder sync", "/tmp/fake-palace", n_results=2
             )
+
+        hits = result["results"]
+        assert hits, "should return results"
+
+        # Invariants on every hit (upstream v3.4.1).
+        for h in hits:
+            assert 0.0 <= h["similarity"] <= 1.0, (
+                f"similarity out of range: {h['similarity']} for {h['source_file']}"
+            )
+            assert 0.0 <= h["effective_distance"] <= 2.0, (
+                f"effective_distance out of range: {h['effective_distance']} for {h['source_file']}"
+            )
+        # Fork reranking promotes the lexical match above the nearer-by-distance doc.
         assert result["results"][0]["source_file"] == "a.txt"
 
     def test_query_variants_expand_candidate_pool(self):
@@ -367,6 +380,17 @@ class TestBM25NoneSafety:
 # ── search() (CLI print function) ─────────────────────────────────────
 
 
+@pytest.fixture
+def fake_palace_path(tmp_path):
+    """tmp_path with chroma.sqlite3 touched so searcher.search's
+    filesystem-first state checks (#1498) pass through to the mocked
+    backend instead of raising on State A / State B."""
+    p = tmp_path / "palace"
+    p.mkdir()
+    (p / "chroma.sqlite3").touch()
+    return str(p)
+
+
 class TestSearchCLI:
     def test_search_prints_results(self, palace_path, seeded_collection, capsys):
         search("JWT authentication", palace_path)
@@ -401,14 +425,14 @@ class TestSearchCLI:
         # Either prints "No results" or returns None
         assert result is None or "No results" in captured.out
 
-    def test_search_query_error_raises(self):
+    def test_search_query_error_raises(self, fake_palace_path):
         """search raises SearchError when query fails."""
         mock_col = MagicMock()
         mock_col.query.side_effect = RuntimeError("boom")
 
         with patch("mempalace.searcher.get_collection", return_value=mock_col):
             with pytest.raises(SearchError, match="Search error"):
-                search("test", "/fake/path")
+                search("test", fake_palace_path)
 
     def test_search_n_results(self, palace_path, seeded_collection, capsys):
         search("code", palace_path, n_results=1)
@@ -416,7 +440,7 @@ class TestSearchCLI:
         # Should have output with at least one result block
         assert "[1]" in captured.out
 
-    def test_search_applies_bm25_hybrid_rerank(self, capsys):
+    def test_search_applies_bm25_hybrid_rerank(self, fake_palace_path, capsys):
         """CLI search must call the same hybrid rerank that the MCP path uses.
 
         Regression for a bug where the CLI only consulted ChromaDB cosine
@@ -451,20 +475,22 @@ class TestSearchCLI:
             "distances": [[1.5, 1.5, 1.5]],
         }
         with patch("mempalace.searcher.get_collection", return_value=mock_col):
-            search("foo bar baz", "/fake/path")
+            search("foo bar baz", fake_palace_path)
         captured = capsys.readouterr()
         first_block, _, _ = captured.out.partition("[2]")
         # Lexical match must rank first
-        assert (
-            "b.md" in first_block
-        ), f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        assert "b.md" in first_block, (
+            f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        )
         # Non-zero bm25 reported
         assert "bm25=" in first_block
         assert "bm25=0.0" not in first_block
-        # Cosine still reported for transparency
-        assert "cosine=" in first_block
+        # Metric-labeled vector similarity still reported for transparency.
+        # Label is now "<metric>_sim=" (honest about the backend's metric)
+        # rather than a hard-coded "cosine=".
+        assert "cosine_sim=" in first_block
 
-    def test_search_warns_when_palace_uses_wrong_distance_metric(self, capsys):
+    def test_search_warns_when_palace_uses_wrong_distance_metric(self, fake_palace_path, capsys):
         """Legacy palaces created without `hnsw:space=cosine` silently
         use L2, which breaks similarity interpretation. CLI must warn
         the user and point them at `mempalace repair` rather than
@@ -477,12 +503,14 @@ class TestSearchCLI:
             "distances": [[1.2]],
         }
         with patch("mempalace.searcher.get_collection", return_value=mock_col):
-            search("anything", "/fake/path")
+            search("anything", fake_palace_path)
         captured = capsys.readouterr()
         assert "mempalace repair" in captured.err
         assert "cosine" in captured.err.lower()
 
-    def test_search_does_not_warn_when_palace_is_correctly_configured(self, capsys):
+    def test_search_does_not_warn_when_palace_is_correctly_configured(
+        self, fake_palace_path, capsys
+    ):
         mock_col = MagicMock()
         mock_col.metadata = {"hnsw:space": "cosine"}
         mock_col.query.return_value = {
@@ -491,11 +519,11 @@ class TestSearchCLI:
             "distances": [[0.3]],
         }
         with patch("mempalace.searcher.get_collection", return_value=mock_col):
-            search("anything", "/fake/path")
+            search("anything", fake_palace_path)
         captured = capsys.readouterr()
         assert "mempalace repair" not in captured.err
 
-    def test_search_handles_none_metadata_without_crash(self, palace_path, capsys):
+    def test_search_handles_none_metadata_without_crash(self, fake_palace_path, capsys):
         """ChromaDB can return `None` entries in the metadatas list when a
         drawer has no metadata. The CLI print path must not crash on them
         mid-render — it used to raise `AttributeError: 'NoneType' object has
@@ -507,14 +535,14 @@ class TestSearchCLI:
             "distances": [[0.1, 0.2]],
         }
         with patch("mempalace.searcher.get_collection", return_value=mock_col):
-            search("anything", "/fake/path")
+            search("anything", fake_palace_path)
         captured = capsys.readouterr()
         assert "[1]" in captured.out
         assert "[2]" in captured.out
         # Second result renders with fallback '?' values instead of crashing
         assert "second doc" in captured.out
 
-    def test_search_handles_none_document_without_crash(self, capsys):
+    def test_search_handles_none_document_without_crash(self, fake_palace_path, capsys):
         mock_col = MagicMock()
         mock_col.metadata = {"hnsw:space": "cosine"}
         mock_col.query.return_value = {
@@ -523,7 +551,7 @@ class TestSearchCLI:
             "distances": [[0.1, 0.2]],
         }
         with patch("mempalace.searcher.get_collection", return_value=mock_col):
-            search("anything", "/fake/path")
+            search("anything", fake_palace_path)
         captured = capsys.readouterr()
         assert "[1]" in captured.out
         assert "[2]" in captured.out
