@@ -2,17 +2,11 @@
 """
 searcher.py — Find anything. Exact words.
 
-Hybrid search against the palace. Combines:
-  • Vector semantic retrieval (ChromaDB cosine distance)
-  • Okapi-BM25 over candidates (IDF corpus-aware)
-  • Query expansion: normalized, keyword-only, quoted-phrase variants
-  • Lexical boosts: keyword overlap (with fuzzy/prefix), quoted phrases,
-    notable entities, temporal signals (PT+EN)
-  • Closet rank boost (topic index signal, never a gate)
-  • Drawer-grep expansion for closet-boosted sources (±1 neighbor)
-
-Signals are additive to the semantic floor: they can only help, never hide.
-Closets and expansion degrade gracefully when absent.
+Hybrid search: BM25 keyword matching + vector semantic similarity. The
+drawer query is the floor — always runs — and closet hits add a rank-based
+boost when they agree. Closets are a ranking *signal*, never a gate, so
+weak closets (regex extraction on narrative content) can only help, never
+hide drawers the direct path would have found.
 """
 
 import logging
@@ -25,302 +19,68 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from .palace import get_closets_collection, get_collection
+from .backends import (
+    BackendError,
+    BackendMismatchError,
+    CollectionNotInitializedError,
+    PalaceNotFoundError,
+    UnsupportedCapabilityError,
+)
+from .config import sqlite_read_uri
+from .palace import (
+    _open_collection_or_explain,
+    get_closets_collection,
+    get_collection,
+    resolve_backend_name,
+)
 
-try:
-    from .backends import (
-        BackendError,
-        BackendMismatchError,
-        CollectionNotInitializedError,
-        PalaceNotFoundError,
-    )
-except Exception:  # pragma: no cover - backends layer always present in v3.4.1+
-    class BackendError(Exception):
-        pass
-
-    class BackendMismatchError(BackendError):
-        pass
-
-    class CollectionNotInitializedError(BackendError):
-        pass
-
-    class PalaceNotFoundError(BackendError):
-        pass
+# Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
+# Multiple lines may join with newlines inside one closet document.
+_CLOSET_DRAWER_REF_RE = re.compile(r"→([\w,]+)")
 
 logger = logging.getLogger("mempalace_mcp")
-
-
-# ── Config ─────────────────────────────────────────────────────────────
-
-DEFAULT_OVERFETCH_FACTOR = 5
-DEFAULT_MIN_CANDIDATES = 25
-
-# Fork-style multiplicative signal weights (distance discounts).
-DEFAULT_HYBRID_WEIGHT = 0.30
-DEFAULT_QUOTED_PHRASE_WEIGHT = 0.60
-DEFAULT_ENTITY_WEIGHT = 0.22
-DEFAULT_TEMPORAL_WEIGHT = 0.35
-DEFAULT_PREFIX_MATCH_WEIGHT = 0.92
-DEFAULT_FUZZY_MATCH_WEIGHT = 0.84
-
-# BM25 convex combo (applied after multiplicative fusion as final sort signal).
-DEFAULT_VECTOR_WEIGHT = 0.70
-DEFAULT_BM25_WEIGHT = 0.30
-
-# Closet rank boosts (upstream) — applied as distance reduction.
-CLOSET_RANK_BOOSTS = [0.40, 0.25, 0.15, 0.08, 0.04]
-CLOSET_DISTANCE_CAP = 1.5
-MAX_HYDRATION_CHARS = 10_000
-
-# Closet pointer line format (upstream): "topic|entities|→drawer_id_a,drawer_id_b"
-_CLOSET_DRAWER_REF_RE = re.compile(r"→([\w,]+)")
-_TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
-
-
-STOP_WORDS = {
-    "a",
-    "about",
-    "after",
-    "again",
-    "ago",
-    "ai",
-    "all",
-    "am",
-    "an",
-    "and",
-    "any",
-    "ao",
-    "aos",
-    "are",
-    "as",
-    "at",
-    "aquela",
-    "aquele",
-    "aquilo",
-    "assim",
-    "ate",
-    "até",
-    "be",
-    "because",
-    "been",
-    "before",
-    "by",
-    "buy",
-    "bought",
-    "com",
-    "como",
-    "da",
-    "das",
-    "de",
-    "del",
-    "dela",
-    "dele",
-    "dessa",
-    "desse",
-    "did",
-    "do",
-    "does",
-    "dos",
-    "e",
-    "ela",
-    "ele",
-    "em",
-    "era",
-    "essa",
-    "esse",
-    "esta",
-    "este",
-    "eu",
-    "faz",
-    "fazer",
-    "foi",
-    "for",
-    "from",
-    "gave",
-    "get",
-    "give",
-    "go",
-    "got",
-    "had",
-    "has",
-    "have",
-    "how",
-    "i",
-    "in",
-    "into",
-    "is",
-    "isso",
-    "isto",
-    "it",
-    "its",
-    "last",
-    "made",
-    "make",
-    "me",
-    "meu",
-    "minha",
-    "my",
-    "na",
-    "nas",
-    "no",
-    "nos",
-    "not",
-    "o",
-    "of",
-    "on",
-    "onde",
-    "or",
-    "os",
-    "ou",
-    "para",
-    "pela",
-    "pelas",
-    "pelo",
-    "pelos",
-    "por",
-    "porque",
-    "qual",
-    "quando",
-    "que",
-    "quem",
-    "se",
-    "sem",
-    "ser",
-    "seu",
-    "sua",
-    "suas",
-    "seus",
-    "sobre",
-    "são",
-    "ta",
-    "tal",
-    "tambem",
-    "também",
-    "te",
-    "tem",
-    "that",
-    "the",
-    "their",
-    "there",
-    "this",
-    "to",
-    "tu",
-    "um",
-    "uma",
-    "umas",
-    "uns",
-    "use",
-    "using",
-    "voces",
-    "vocês",
-    "was",
-    "we",
-    "were",
-    "what",
-    "when",
-    "where",
-    "which",
-    "who",
-    "why",
-    "with",
-    "you",
-    "your",
-}
-
-NOTABLE_ENTITY_WORDS = {
-    "And",
-    "Ao",
-    "Aos",
-    "As",
-    "At",
-    "Can",
-    "Com",
-    "Como",
-    "Could",
-    "Da",
-    "Das",
-    "De",
-    "Did",
-    "Do",
-    "Does",
-    "Dos",
-    "E",
-    "Ela",
-    "Ele",
-    "Em",
-    "Esta",
-    "Este",
-    "For",
-    "From",
-    "Ha",
-    "How",
-    "I",
-    "In",
-    "Is",
-    "Isto",
-    "It",
-    "Its",
-    "Just",
-    "Last",
-    "May",
-    "Monday",
-    "More",
-    "My",
-    "Na",
-    "Nas",
-    "No",
-    "Nos",
-    "November",
-    "O",
-    "October",
-    "On",
-    "Onde",
-    "Os",
-    "Our",
-    "Para",
-    "Pela",
-    "Pelas",
-    "Pelo",
-    "Pelos",
-    "Por",
-    "Previously",
-    "Qual",
-    "Quando",
-    "Que",
-    "Quem",
-    "Recently",
-    "Saturday",
-    "September",
-    "Se",
-    "Sem",
-    "Should",
-    "Sunday",
-    "That",
-    "The",
-    "Their",
-    "This",
-    "Thursday",
-    "To",
-    "Tuesday",
-    "Wednesday",
-    "What",
-    "When",
-    "Where",
-    "Which",
-    "Who",
-    "Why",
-    "Will",
-    "With",
-    "Would",
-    "You",
-}
 
 
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
 
 
-# ── Tokenization / normalization ───────────────────────────────────────
+_TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+
+# Local retrieval tuning retained across the v3.6 merge. These signals only
+# lower a candidate's effective distance, so vector retrieval remains the
+# floor and lexical or temporal evidence can only improve a result's rank.
+_LOCAL_HYBRID_WEIGHT = 0.30
+_LOCAL_QUOTED_PHRASE_WEIGHT = 0.60
+_LOCAL_ENTITY_WEIGHT = 0.22
+_LOCAL_TEMPORAL_WEIGHT = 0.35
+_LOCAL_PREFIX_MATCH_WEIGHT = 0.92
+_LOCAL_FUZZY_MATCH_WEIGHT = 0.84
+
+_LOCAL_STOP_WORDS = frozenset(
+    """
+    a about after again ago ai all am an and any ao aos are as at aquela aquele
+    aquilo assim ate até be because been before by buy bought com como da das de
+    del dela dele dessa desse did do does dos e ela ele em era essa esse esta este
+    eu faz fazer foi for from gave get give go got had has have how i in into is
+    isso isto it its last made make me meu minha my na nas no nos not o of on onde
+    or os ou para pela pelas pelo pelos por porque qual quando que quem se sem ser
+    seu sua suas seus sobre são ta tal tambem também te tem that the their there
+    this to tu um uma umas uns use using voces vocês was we were what when where
+    which who why with you your
+    """.split()
+)
+
+_LOCAL_ENTITY_STOP_WORDS = frozenset(
+    """
+    And Ao Aos As At Can Com Como Could Da Das De Did Do Does Dos E Ela Ele Em
+    Esta Este For From Ha How I In Is Isto It Its Just Last May Monday More My Na
+    Nas No Nos November O October On Onde Os Our Para Pela Pelas Pelo Pelos Por
+    Previously Qual Quando Que Quem Recently Saturday September Se Sem Should
+    Sunday That The Their This Thursday To Tuesday Wednesday What When Where Which
+    Who Why Will With Would You
+    """.split()
+)
 
 
 def _first_or_empty(results, key: str) -> list:
@@ -351,27 +111,19 @@ def _tokenize(text: str) -> list:
 
 
 def _normalize_text(text: str) -> str:
-    """NFKD-normalize, strip diacritics, lowercase."""
+    """Normalize Unicode text for accent-insensitive lexical matching."""
     if not text:
         return ""
-    text = unicodedata.normalize("NFKD", text)
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    return text.lower()
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch)).lower()
 
 
-def _utc_now() -> datetime:
-    return datetime.now()
-
-
-def _extract_keywords(text: str, excluded_tokens: set = None) -> list:
-    """Extract meaningful keyword tokens (≥3 chars, not stopwords)."""
-    normalized = _normalize_text(text)
-    tokens = re.findall(r"\b[a-z0-9]{3,}\b", normalized)
+def _extract_keywords(text: str, excluded_tokens: set | None = None) -> list:
+    excluded_tokens = excluded_tokens or set()
     seen = set()
     keywords = []
-    excluded_tokens = excluded_tokens or set()
-    for token in tokens:
-        if token in STOP_WORDS or token in excluded_tokens or token in seen:
+    for token in re.findall(r"\b[a-z0-9]{3,}\b", _normalize_text(text)):
+        if token in _LOCAL_STOP_WORDS or token in excluded_tokens or token in seen:
             continue
         seen.add(token)
         keywords.append(token)
@@ -379,7 +131,6 @@ def _extract_keywords(text: str, excluded_tokens: set = None) -> list:
 
 
 def _extract_quoted_phrases(text: str) -> list:
-    """Extract phrases enclosed in straight or curly quotes."""
     phrases = []
     for pattern in (
         r"'([^']{3,80})'",
@@ -388,76 +139,48 @@ def _extract_quoted_phrases(text: str) -> list:
         r"‘([^’]{3,80})’",
     ):
         phrases.extend(re.findall(pattern, text))
-
-    seen = set()
-    unique = []
-    for phrase in phrases:
-        cleaned = phrase.strip()
-        if cleaned and cleaned not in seen:
-            seen.add(cleaned)
-            unique.append(cleaned)
-    return unique
+    return list(dict.fromkeys(phrase.strip() for phrase in phrases if phrase.strip()))
 
 
 def _extract_notable_entities(text: str) -> list:
-    """Extract proper-noun-like tokens (capitalized, not in stoplist)."""
     candidates = re.findall(r"\b(?:[A-Z][a-z0-9]{2,15}|[A-Z0-9]{2,15})\b", text)
     seen = set()
     entities = []
     for candidate in candidates:
-        if candidate in NOTABLE_ENTITY_WORDS:
-            continue
         normalized = _normalize_text(candidate)
-        if len(normalized) < 3 or normalized in seen:
+        if candidate in _LOCAL_ENTITY_STOP_WORDS or len(normalized) < 3 or normalized in seen:
             continue
         seen.add(normalized)
         entities.append(candidate)
     return entities
 
 
-# ── Overlap scores ─────────────────────────────────────────────────────
-
-
 def _token_match_score(query_token: str, doc_token: str) -> float:
-    """Exact / prefix (≥5) / fuzzy (SequenceMatcher ratio ≥ 0.90) match."""
     if query_token == doc_token:
         return 1.0
-
     min_len = min(len(query_token), len(doc_token))
-    if min_len >= 5 and (query_token.startswith(doc_token) or doc_token.startswith(query_token)):
-        return DEFAULT_PREFIX_MATCH_WEIGHT
-
-    if min_len >= 5 and query_token[:5] == doc_token[:5]:
-        return DEFAULT_PREFIX_MATCH_WEIGHT
-
-    if min_len >= 6:
-        ratio = SequenceMatcher(None, query_token, doc_token).ratio()
-        if ratio >= 0.90:
-            return DEFAULT_FUZZY_MATCH_WEIGHT
-
+    if min_len >= 5 and (
+        query_token.startswith(doc_token)
+        or doc_token.startswith(query_token)
+        or query_token[:5] == doc_token[:5]
+    ):
+        return _LOCAL_PREFIX_MATCH_WEIGHT
+    if min_len >= 6 and SequenceMatcher(None, query_token, doc_token).ratio() >= 0.90:
+        return _LOCAL_FUZZY_MATCH_WEIGHT
     return 0.0
 
 
 def _keyword_overlap(query_keywords: list, doc_text: str) -> float:
-    """Average best-match score per query keyword vs doc tokens."""
+    """Average best-match score, including accent-insensitive fuzzy matches."""
     if not query_keywords:
         return 0.0
-
     doc_tokens = set(re.findall(r"\b[a-z0-9]{3,}\b", _normalize_text(doc_text)))
     if not doc_tokens:
         return 0.0
-
-    scores = []
-    for keyword in query_keywords:
-        best = 0.0
-        for doc_token in doc_tokens:
-            score = _token_match_score(keyword, doc_token)
-            if score > best:
-                best = score
-                if best == 1.0:
-                    break
-        scores.append(best)
-
+    scores = [
+        max((_token_match_score(keyword, token) for token in doc_tokens), default=0.0)
+        for keyword in query_keywords
+    ]
     return sum(scores) / len(scores)
 
 
@@ -465,8 +188,7 @@ def _quoted_phrase_overlap(phrases: list, doc_text: str) -> float:
     if not phrases:
         return 0.0
     normalized_doc = _normalize_text(doc_text)
-    hits = sum(1 for phrase in phrases if _normalize_text(phrase) in normalized_doc)
-    return hits / len(phrases)
+    return sum(_normalize_text(phrase) in normalized_doc for phrase in phrases) / len(phrases)
 
 
 def _entity_overlap(entities: list, doc_text: str) -> float:
@@ -475,79 +197,110 @@ def _entity_overlap(entities: list, doc_text: str) -> float:
     doc_tokens = set(re.findall(r"\b[a-z0-9]{3,}\b", _normalize_text(doc_text)))
     if not doc_tokens:
         return 0.0
-    hits = 0
-    for entity in entities:
-        token = _normalize_text(entity)
-        if token in doc_tokens:
-            hits += 1
-    return hits / len(entities)
+    return sum(_normalize_text(entity) in doc_tokens for entity in entities) / len(entities)
 
 
-def _distance_to_similarity(distance, metric: str = "cosine") -> float:
-    """Map a backend-reported ``distance`` to a [0, 1]-ish similarity.
+def _utc_now() -> datetime:
+    return datetime.now()
 
-    Metric-aware (matches upstream v3.4.1 + the RFC-001 backend contract:
-    the ``distances`` field is always *lower = closer*):
 
-    * ``l2``     — Euclidean ∈ [0, ∞):    ``1 / (1 + d)``. This palace's
-                   ``mempalace_drawers`` collection is L2 (hnsw.space=l2),
-                   so this is the active branch — and it equals the fork's
-                   historical ``1 / (1 + d)``, preserving reported scores.
-    * ``cosine`` — distance ∈ [0, 2]:     ``max(0, 1 - d)``.
-    * ``ip``     — inner-product distance: logistic ``1 / (1 + e^d)``.
+def _parse_metadata_datetime(metadata: dict):
+    raw_date = metadata.get("date")
+    if raw_date:
+        try:
+            return datetime.fromisoformat(str(raw_date))
+        except ValueError:
+            pass
+    for key in ("timestamp", "filed_at"):
+        value = metadata.get(key)
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
+        except ValueError:
+            continue
+    source_mtime = metadata.get("source_mtime")
+    if source_mtime not in (None, ""):
+        try:
+            return datetime.fromtimestamp(float(source_mtime))
+        except (TypeError, ValueError, OSError):
+            return None
+    return None
 
-    ``None`` (vector-unknown / BM25-only candidate) maps to 0.0. A closet
-    boost can drive effective distance below zero, so the l2 branch clamps.
-    """
-    if distance is None:
+
+def _extract_temporal_signal(query: str, reference_now: datetime | None = None):
+    now = reference_now or _utc_now()
+    normalized = _normalize_text(query)
+    match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", normalized)
+    if match:
+        try:
+            return datetime.fromisoformat(match.group(1)), 1
+        except ValueError:
+            pass
+    direct_patterns = (
+        (r"\b(today|hoje)\b", (now, 1)),
+        (r"\b(yesterday|ontem)\b", (now - timedelta(days=1), 1)),
+        (r"\b(day before yesterday|anteontem)\b", (now - timedelta(days=2), 1)),
+        (r"\b(last week|semana passada)\b", (now - timedelta(days=7), 4)),
+        (r"\b(last month|mes passado)\b", (now - timedelta(days=30), 7)),
+        (r"\b(last year|ano passado)\b", (now - timedelta(days=365), 30)),
+        (r"\b(recently|recentemente)\b", (now - timedelta(days=14), 14)),
+    )
+    for pattern, signal in direct_patterns:
+        if re.search(pattern, normalized):
+            return signal
+    quantified = (
+        (r"\b(\d+)\s+days?\s+ago\b", 1, 1),
+        (r"\bha\s+(\d+)\s+dias?\b", 1, 1),
+        (r"\b(\d+)\s+weeks?\s+ago\b", 7, 5),
+        (r"\bha\s+(\d+)\s+semanas?\b", 7, 5),
+        (r"\b(\d+)\s+months?\s+ago\b", 30, 10),
+        (r"\bha\s+(\d+)\s+mes(?:es)?\b", 30, 10),
+        (r"\b(\d+)\s+years?\s+ago\b", 365, 30),
+        (r"\bha\s+(\d+)\s+anos?\b", 365, 30),
+    )
+    for pattern, multiplier, tolerance in quantified:
+        match = re.search(pattern, normalized)
+        if match:
+            quantity = int(match.group(1))
+            if multiplier == 1:
+                tolerance = max(tolerance, min(quantity, 3))
+            return now - timedelta(days=quantity * multiplier), tolerance
+    return None
+
+
+def _temporal_overlap(query: str, metadata: dict) -> float:
+    signal = _extract_temporal_signal(query)
+    candidate_dt = _parse_metadata_datetime(metadata)
+    if not signal or not candidate_dt:
         return 0.0
-    m = (metric or "cosine").lower()
-    if m == "l2":
-        return round(min(1.0, 1.0 / (1.0 + max(0.0, distance))), 3)
-    if m == "ip":
-        return round(1.0 / (1.0 + math.exp(min(60.0, distance))), 3)
-    return round(max(0.0, 1.0 - distance), 3)
+    target_dt, tolerance = signal
+    delta_days = abs((candidate_dt.date() - target_dt.date()).days)
+    if delta_days <= tolerance:
+        return 1.0
+    extended_window = max(tolerance * 3, tolerance + 2)
+    if delta_days > extended_window:
+        return 0.0
+    return max(
+        0.0,
+        1.0 - ((delta_days - tolerance) / max(extended_window - tolerance, 1)),
+    )
 
 
-def _metric_for_collection(col) -> str:
-    """Resolve a collection's declared distance metric (``l2`` / ``cosine`` / ``ip``).
-
-    Tries, in order: the RFC-001 ``distance_metric`` attribute (backends),
-    the legacy ``hnsw:space`` in ``metadata``, then the chroma 1.5.x
-    ``configuration_json`` ``hnsw.space``. Falls back to ``cosine``.
-
-    Critical for this palace: ``mempalace_drawers`` declares ``hnsw.space=l2``
-    *only* in ``configuration_json`` (its ``metadata`` is ``None``). Reading
-    just the attribute or metadata would default to cosine and zero every
-    semantic score (``max(0, 1-d)=0`` for the L2 distances ~1.4 this palace
-    produces). Upstream's resolver alone would mis-detect this collection.
-    """
-    metric = None
-    try:
-        metric = getattr(col, "distance_metric", None)
-    except Exception:
-        metric = None
-    if not metric:
-        try:
-            meta = getattr(col, "metadata", None)
-            if isinstance(meta, dict):
-                metric = meta.get("hnsw:space")
-        except Exception:
-            pass
-    if not metric:
-        try:
-            cfg = getattr(col, "configuration_json", None)
-            if cfg is None and hasattr(col, "_model"):
-                cfg = getattr(col._model, "configuration_json", None)
-            if isinstance(cfg, dict):
-                metric = (cfg.get("hnsw") or {}).get("space")
-        except Exception:
-            pass
-    metric = str(metric or "cosine").lower()
-    return metric if metric in ("cosine", "l2", "ip") else "cosine"
-
-
-# ── BM25 (Okapi, corpus-relative IDF over candidate set) ───────────────
+def _build_query_variants(query: str) -> list:
+    """Expand semantic retrieval with normalized, keyword and phrase forms."""
+    variants = []
+    for candidate in (
+        query,
+        _normalize_text(query),
+        " ".join(_extract_keywords(query)),
+        *_extract_quoted_phrases(query),
+    ):
+        cleaned = candidate.strip()
+        if cleaned and cleaned not in variants:
+            variants.append(cleaned)
+    return variants
 
 
 def _bm25_scores(
@@ -558,8 +311,18 @@ def _bm25_scores(
 ) -> list:
     """Compute Okapi-BM25 scores for ``query`` against each document.
 
-    IDF is computed over the provided corpus with the Lucene/BM25+ smoothed
-    formula: ``log((N - df + 0.5) / (df + 0.5) + 1)``.
+    IDF is computed over the *provided corpus* using the Lucene/BM25+
+    smoothed formula ``log((N - df + 0.5) / (df + 0.5) + 1)``, which is
+    always non-negative. This is well-defined for re-ranking a small
+    candidate set returned by vector retrieval — IDF then reflects how
+    discriminative each query term is *within the candidates*, exactly
+    what's needed to reorder them.
+
+    Parameters mirror Okapi-BM25 conventions:
+        k1 — term-frequency saturation (1.2-2.0 typical, 1.5 default)
+        b  — length normalization (0.0 = none, 1.0 = full, 0.75 default)
+
+    Returns a list of scores in the same order as ``documents``.
     """
     n_docs = len(documents)
     query_terms = set(_tokenize(query))
@@ -572,6 +335,7 @@ def _bm25_scores(
         return [0.0] * n_docs
     avgdl = sum(doc_lens) / n_docs or 1.0
 
+    # Document frequency: how many docs contain each query term?
     df = {term: 0 for term in query_terms}
     for toks in tokenized:
         seen = set(toks) & query_terms
@@ -585,7 +349,7 @@ def _bm25_scores(
         if dl == 0:
             scores.append(0.0)
             continue
-        tf = {}
+        tf: dict = {}
         for t in toks:
             if t in query_terms:
                 tf[t] = tf.get(t, 0) + 1
@@ -598,184 +362,157 @@ def _bm25_scores(
     return scores
 
 
-# ── Temporal signals (PT+EN) ───────────────────────────────────────────
+def _distance_to_similarity(distance, metric: str = "cosine") -> float:
+    """Map a backend-reported ``distance`` to a [0, 1]-ish similarity.
 
+    The backend contract for the ``distances`` field is *lower = closer*
+    regardless of metric (RFC 001, backend metric declaration), so every
+    mapping here is monotonic decreasing in ``distance``. The output stays
+    bounded so it is
+    commensurable with the min-max-normalized BM25 term in
+    :func:`_hybrid_rank`.
 
-def _parse_metadata_datetime(metadata: dict):
-    raw_date = metadata.get("date")
-    if raw_date:
-        try:
-            return datetime.fromisoformat(str(raw_date))
-        except ValueError:
-            pass
+    * ``cosine`` — distance ∈ [0, 2], 0 = identical: ``max(0, 1 - d)``.
+    * ``l2`` — Euclidean ∈ [0, ∞): ``1 / (1 + d)`` (1 at d=0, →0 as d→∞).
+    * ``ip`` — inner-product distance (e.g. pgvector ``<#>`` = -dot, lower =
+      closer), unbounded and signed: logistic squash ``1 / (1 + e^d)``.
+      Provisional until a real ip backend exercises it; no in-tree backend
+      uses ip today.
 
-    for key in ("timestamp", "filed_at"):
-        value = metadata.get(key)
-        if not value:
-            continue
-        try:
-            cleaned = str(value).replace("Z", "+00:00")
-            parsed = datetime.fromisoformat(cleaned)
-            if parsed.tzinfo is not None:
-                parsed = parsed.astimezone().replace(tzinfo=None)
-            return parsed
-        except ValueError:
-            continue
-
-    source_mtime = metadata.get("source_mtime")
-    if source_mtime not in (None, ""):
-        try:
-            return datetime.fromtimestamp(float(source_mtime))
-        except (TypeError, ValueError, OSError):
-            return None
-
-    return None
-
-
-def _extract_temporal_signal(query: str, reference_now: datetime = None):
-    """Extract (target_datetime, tolerance_days) from PT+EN temporal cues."""
-    now = reference_now or _utc_now()
-    normalized = _normalize_text(query)
-
-    match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", normalized)
-    if match:
-        try:
-            return datetime.fromisoformat(match.group(1)), 1
-        except ValueError:
-            pass
-
-    direct_patterns = [
-        (r"\b(today|hoje)\b", (now, 1)),
-        (r"\b(yesterday|ontem)\b", (now - timedelta(days=1), 1)),
-        (r"\b(day before yesterday|anteontem)\b", (now - timedelta(days=2), 1)),
-        (r"\b(last week|semana passada)\b", (now - timedelta(days=7), 4)),
-        (r"\b(last month|mes passado)\b", (now - timedelta(days=30), 7)),
-        (r"\b(last year|ano passado)\b", (now - timedelta(days=365), 30)),
-        (r"\b(recently|recentemente)\b", (now - timedelta(days=14), 14)),
-    ]
-    for pattern, signal in direct_patterns:
-        if re.search(pattern, normalized):
-            return signal
-
-    quantified_patterns = [
-        (r"\b(\d+)\s+days?\s+ago\b", 1),
-        (r"\bha\s+(\d+)\s+dias?\b", 1),
-        (r"\b(\d+)\s+weeks?\s+ago\b", 5),
-        (r"\bha\s+(\d+)\s+semanas?\b", 5),
-        (r"\b(\d+)\s+months?\s+ago\b", 10),
-        (r"\bha\s+(\d+)\s+mes(?:es)?\b", 10),
-        (r"\b(\d+)\s+years?\s+ago\b", 30),
-        (r"\bha\s+(\d+)\s+anos?\b", 30),
-    ]
-    for pattern, tolerance in quantified_patterns:
-        match = re.search(pattern, normalized)
-        if not match:
-            continue
-        quantity = int(match.group(1))
-        if "day" in pattern or "dias" in pattern:
-            return now - timedelta(days=quantity), max(tolerance, min(quantity, 3))
-        if "week" in pattern or "semanas" in pattern:
-            return now - timedelta(days=quantity * 7), tolerance
-        if "month" in pattern or "mes" in pattern:
-            return now - timedelta(days=quantity * 30), tolerance
-        return now - timedelta(days=quantity * 365), tolerance
-
-    return None
-
-
-def _temporal_overlap(query: str, metadata: dict) -> float:
-    signal = _extract_temporal_signal(query)
-    if not signal:
+    ``distance is None`` (vector-unknown, e.g. a BM25-only candidate) maps to
+    0.0 so the candidate scores on its BM25 contribution alone.
+    """
+    if distance is None:
         return 0.0
-
-    candidate_dt = _parse_metadata_datetime(metadata)
-    if not candidate_dt:
-        return 0.0
-
-    target_dt, tolerance = signal
-    delta_days = abs((candidate_dt.date() - target_dt.date()).days)
-    if delta_days <= tolerance:
-        return 1.0
-
-    extended_window = max(tolerance * 3, tolerance + 2)
-    if delta_days > extended_window:
-        return 0.0
-
-    return max(0.0, 1.0 - ((delta_days - tolerance) / max(extended_window - tolerance, 1)))
+    m = (metric or "cosine").lower()
+    if m == "l2":
+        return 1.0 / (1.0 + max(0.0, distance))
+    if m == "ip":
+        # Clamp the exponent so a large positive distance can't overflow.
+        return 1.0 / (1.0 + math.exp(min(60.0, distance)))
+    # cosine (default)
+    return max(0.0, 1.0 - distance)
 
 
-# ── Query expansion ────────────────────────────────────────────────────
+def _metric_for_collection(col) -> str:
+    """Resolve a collection's declared distance metric, defaulting to cosine.
 
-
-def _build_query_variants(query: str) -> list:
-    """Produce distinct query strings (original, normalized, keywords-only,
-    quoted phrases) to expand recall during semantic retrieval."""
-    variants = []
-
-    def add_variant(candidate: str):
-        cleaned = candidate.strip()
-        if cleaned and cleaned not in variants:
-            variants.append(cleaned)
-
-    add_variant(query)
-
-    normalized = _normalize_text(query)
-    if normalized != query.strip().lower():
-        add_variant(normalized)
-
-    keywords = _extract_keywords(query)
-    if keywords:
-        add_variant(" ".join(keywords))
-
-    for phrase in _extract_quoted_phrases(query):
-        add_variant(phrase)
-
-    return variants
-
-
-def _build_where_filter(wing: str = None, room: str = None) -> dict:
-    if wing and room:
-        return {"$and": [{"wing": wing}, {"room": room}]}
-    if wing:
-        return {"wing": wing}
-    if room:
-        return {"room": room}
-    return {}
-
-
-def build_where_filter(wing: str = None, room: str = None) -> dict:
-    """Public alias (upstream spelling)."""
-    return _build_where_filter(wing=wing, room=room)
-
-
-def _warn_if_legacy_metric(col) -> None:
-    """Print a one-line notice for palaces created without cosine distance."""
+    Reads the ``distance_metric`` exposed by the backend collection (the
+    RFC 001 backend metric declaration). ``EmbeddingCollection`` delegates the
+    attribute to its inner collection; legacy Chroma palaces report their
+    actual ``hnsw:space``.
+    Any failure falls back to ``"cosine"`` — the value all in-tree backends
+    use and the only metric MemPalace created palaces with historically.
+    """
+    metric = None
     try:
-        meta = getattr(col, "metadata", None)
+        metric = getattr(col, "distance_metric", None)
     except Exception:
-        return
-    if not isinstance(meta, dict):
-        return
-    space = meta.get("hnsw:space")
-    if space == "cosine":
-        return
-    import sys as _sys
+        pass
+    if not metric:
+        try:
+            metadata = getattr(col, "metadata", None)
+            if isinstance(metadata, dict):
+                metric = metadata.get("hnsw:space")
+        except Exception:
+            pass
+    if not metric:
+        try:
+            configuration = getattr(col, "configuration_json", None)
+            if configuration is None and hasattr(col, "_model"):
+                configuration = getattr(col._model, "configuration_json", None)
+            if isinstance(configuration, dict):
+                metric = (configuration.get("hnsw") or {}).get("space")
+        except Exception:
+            pass
+    metric = str(metric or "cosine").lower()
+    return metric if metric in ("cosine", "l2", "ip") else "cosine"
 
-    detail = f"hnsw:space={space!r}" if space else "no hnsw:space metadata"
-    print(
-        f"\n  NOTICE: this palace was created without cosine distance ({detail}).\n"
-        "          Semantic similarity scores will not be meaningful.\n"
-        "          Run `mempalace repair` to rebuild the index with the correct metric.",
-        file=_sys.stderr,
+
+def _hybrid_rank(
+    results: list,
+    query: str,
+    vector_weight: float = 0.6,
+    bm25_weight: float = 0.4,
+    metric: str = "cosine",
+) -> list:
+    """Re-rank ``results`` by a convex combination of vector similarity and BM25.
+
+    * Vector similarity is derived from each candidate's backend-reported
+      ``distance`` via :func:`_distance_to_similarity`, interpreted in the
+      collection's declared ``metric`` (per RFC 001) rather than assuming
+      cosine. Absolute (not relative-to-max) means adding/removing a
+      candidate can't reshuffle the others.
+    * BM25 is real Okapi-BM25 with corpus-relative IDF over the candidates
+      themselves. Since the absolute scale is unbounded, BM25 is min-max
+      normalized within the candidate set so weights are commensurable.
+
+    Candidates with ``distance=None`` are treated as vector-unknown
+    (no vector signal available) and scored on BM25 contribution alone.
+    Used by candidate-union mode to merge BM25-only candidates that the
+    vector index didn't surface.
+
+    Mutates each result dict to add ``bm25_score`` and reorders the list
+    in place. Returns the same list for convenience.
+    """
+    if not results:
+        return results
+
+    docs = [r.get("text", "") for r in results]
+    bm25_raw = _bm25_scores(query, docs)
+    max_bm25 = max(bm25_raw) if bm25_raw else 0.0
+    bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
+
+    scored = []
+    for r, raw, norm in zip(results, bm25_raw, bm25_norm):
+        effective_distance = r.get("effective_distance")
+        rank_distance = r.get("distance") if effective_distance is None else effective_distance
+        vec_sim = _distance_to_similarity(rank_distance, metric)
+        r["bm25_score"] = round(raw, 3)
+        scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
+
+    # Break exact score ties toward the more recently authored drawer so equal-score
+    # candidates rank chronologically instead of in arbitrary backend order. ISO-8601
+    # ``authored_at`` strings sort chronologically; missing dates sort oldest.
+    # authored_at lives at the top level on the search_memories path and nested under
+    # "metadata" on the candidate-union path; check both so the tie-break works for each.
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            pair[1].get("authored_at") or pair[1].get("metadata", {}).get("authored_at") or "",
+        ),
+        reverse=True,
     )
+    results[:] = [r for _, r in scored]
+    return results
 
 
-# ── Closet helpers (upstream) ──────────────────────────────────────────
+def build_where_filter(wing: str = None, room: str = None, source_file: str = None) -> dict:
+    """Build a ChromaDB where filter from optional wing/room/source_file.
+
+    ChromaDB needs a ``$and`` only when ≥2 clauses are present; a single
+    clause is returned bare and zero clauses yield an empty filter (#1815).
+    """
+    clauses = []
+    if wing:
+        clauses.append({"wing": wing})
+    if room:
+        clauses.append({"room": room})
+    if source_file:
+        clauses.append({"source_file": source_file})
+    if not clauses:
+        return {}
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
-    """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet doc."""
-    seen = {}
+    """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
+
+    Preserves order and dedupes.
+    """
+    seen: dict = {}
     for match in _CLOSET_DRAWER_REF_RE.findall(closet_doc):
         for did in match.split(","):
             did = did.strip()
@@ -785,32 +522,56 @@ def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
 
 
 def _scoped_source_filter(source_file: str, parent_drawer_id=None) -> dict:
-    """Scope a query to ``source_file``, additionally narrowed by
-    ``parent_drawer_id`` when present (#1580 — two oversized chunked writes
-    can share a ``source_file`` but each carries its own ``parent_drawer_id``
-    group; the bare file filter would stitch chunks across both groups).
+    """Build a Chroma ``where`` clause that scopes a query to ``source_file``,
+    additionally constrained by ``parent_drawer_id`` when one is supplied.
+
+    Two unrelated oversized ``tool_add_drawer`` writes (chunked path from
+    #1539) can pass the same ``source_file`` (e.g. two pastes tagged
+    ``"chat.log"``); each call stores its own ``parent_drawer_id`` group
+    of chunks but the bare ``source_file`` filter pulls chunks from both
+    groups as if they were siblings (#1580). When the matched chunk
+    carries a ``parent_drawer_id`` the filter narrows to that logical
+    group. Otherwise (pre-#1539 drawers, single-chunk writes, and
+    ``diary_ingest`` drawers grouped by real file path) the original
+    file-global shape is preserved. Mirrors the conditional-``$and``
+    precedent in ``build_where_filter``.
     """
     if parent_drawer_id:
-        return {"$and": [{"source_file": source_file}, {"parent_drawer_id": parent_drawer_id}]}
+        return {
+            "$and": [
+                {"source_file": source_file},
+                {"parent_drawer_id": parent_drawer_id},
+            ]
+        }
     return {"source_file": source_file}
 
 
-def _expand_with_neighbors(
-    drawers_col,
-    matched_doc: str,
-    matched_meta: dict,
-    radius: int = 1,
-):
-    """Upstream-compatible: expand around the matched ``chunk_index`` in the
-    same source_file. Used by callers that already know which chunk matched.
-    Narrows by ``parent_drawer_id`` when present so chunks from unrelated
-    logical drawers sharing a ``source_file`` do not stitch (#1580).
+def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, radius: int = 1):
+    """Expand a matched drawer with its ±radius sibling chunks in the same source file.
+
+    Motivation — "drawer-grep context" feature: a closet hit returns one
+    drawer, but the chunk boundary may clip mid-thought (e.g., the matched
+    chunk says "here's a breakdown:" and the actual breakdown lives in the
+    next chunk). Fetching the small neighborhood around the match gives
+    callers enough context without forcing a follow-up ``get_drawer`` call.
+
+    Returns a dict with:
+        ``text``            combined chunks in chunk_index order
+        ``drawer_index``    the matched chunk's index in the source file
+        ``total_drawers``   total drawer count for the source file (or None)
+
+    On any ChromaDB failure or missing metadata, falls back to returning the
+    matched drawer alone so search never breaks because neighbor expansion
+    failed.
     """
     src = matched_meta.get("source_file")
     chunk_idx = matched_meta.get("chunk_index")
     if not src or not isinstance(chunk_idx, int):
         return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
 
+    # Narrow by ``parent_drawer_id`` when present so chunks from unrelated
+    # logical drawers sharing ``source_file`` do not stitch (#1580). See
+    # ``_scoped_source_filter`` for the contract.
     parent_id = matched_meta.get("parent_drawer_id")
     target_indexes = [chunk_idx + offset for offset in range(-radius, radius + 1)]
     neighbor_clauses = [
@@ -828,7 +589,7 @@ def _expand_with_neighbors(
         return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
 
     indexed_docs = []
-    for doc, meta in zip(neighbors.get("documents") or [], neighbors.get("metadatas") or []):
+    for doc, meta in zip(neighbors.documents, neighbors.metadatas):
         ci = meta.get("chunk_index")
         if isinstance(ci, int):
             indexed_docs.append((ci, doc))
@@ -839,15 +600,19 @@ def _expand_with_neighbors(
     else:
         combined_text = "\n\n".join(doc for _, doc in indexed_docs)
 
+    # Cheap total_drawers lookup. When ``parent_drawer_id`` is present the
+    # count is scoped to that group so the returned number matches the
+    # text the caller gets back. Without a parent id, the legacy
+    # file-global count is preserved.
     total_drawers = None
     try:
         all_meta = drawers_col.get(
-            where=_scoped_source_filter(src, parent_id), include=["metadatas"]
+            where=_scoped_source_filter(src, parent_id),
+            include=["metadatas"],
         )
-        ids = all_meta.get("ids") or []
-        total_drawers = len(ids) if ids else None
+        total_drawers = len(all_meta.ids) if all_meta.ids else None
     except Exception:
-        pass
+        logger.debug("total_drawers lookup failed for %s", src, exc_info=True)
 
     return {
         "text": combined_text,
@@ -856,450 +621,195 @@ def _expand_with_neighbors(
     }
 
 
-def _drawer_grep_expand(
-    drawers_col,
-    query: str,
-    matched_doc: str,
-    matched_meta: dict,
-    radius: int = 1,
-):
-    """Closet-boost companion: find the best-keyword chunk in the source_file
-    and return it plus ± neighbors. Closets say *which source* is relevant;
-    vector may have landed on the wrong chunk within it — grep picks the right
-    one."""
-    src = matched_meta.get("source_file")
-    if not src:
-        return {"text": matched_doc, "drawer_index": None, "total_drawers": None}
+def _warn_if_legacy_metric(col) -> None:
+    """Print a one-line notice if the palace was created without
+    ``hnsw:space=cosine``.
 
-    parent_id = matched_meta.get("parent_drawer_id")
-    try:
-        source_drawers = drawers_col.get(
-            where=_scoped_source_filter(src, parent_id),
-            include=["documents", "metadatas"],
-        )
-    except Exception:
-        return {"text": matched_doc, "drawer_index": None, "total_drawers": None}
+    ChromaDB's default is L2 (Euclidean), under which cosine-based
+    similarity interpretation falls apart — distances routinely exceed
+    1.0 and the display ``max(0, 1 - dist)`` floors every result to 0.
+    Legacy palaces (mined before this metadata was consistently set)
+    need ``mempalace repair`` to rebuild with the correct metric.
 
-    docs = source_drawers.get("documents") or []
-    metas = source_drawers.get("metadatas") or []
-    if len(docs) <= 1:
-        return {
-            "text": matched_doc,
-            "drawer_index": None,
-            "total_drawers": len(docs) or None,
-        }
-
-    indexed = []
-    for idx, (d, m) in enumerate(zip(docs, metas)):
-        ci = m.get("chunk_index", idx) if isinstance(m, dict) else idx
-        if not isinstance(ci, int):
-            ci = idx
-        indexed.append((ci, d))
-    indexed.sort(key=lambda p: p[0])
-    ordered_docs = [d for _, d in indexed]
-
-    query_terms = set(_tokenize(query))
-    best_idx, best_score = 0, -1
-    for idx, d in enumerate(ordered_docs):
-        d_lower = d.lower()
-        s = sum(1 for t in query_terms if t in d_lower)
-        if s > best_score:
-            best_score, best_idx = s, idx
-
-    start = max(0, best_idx - radius)
-    end = min(len(ordered_docs), best_idx + radius + 1)
-    expanded = "\n\n".join(ordered_docs[start:end])
-    if len(expanded) > MAX_HYDRATION_CHARS:
-        expanded = (
-            expanded[:MAX_HYDRATION_CHARS]
-            + f"\n\n[...truncated. {len(ordered_docs)} total drawers. "
-            "Use mempalace_get_drawer for full content.]"
-        )
-
-    return {
-        "text": expanded,
-        "drawer_index": best_idx,
-        "total_drawers": len(ordered_docs),
-    }
-
-
-def _hybrid_rank(
-    results: list,
-    query: str,
-    vector_weight: float = 0.6,
-    bm25_weight: float = 0.4,
-    metric: str = "cosine",
-) -> list:
-    """Re-rank ``results`` by a convex combination of vector similarity + BM25.
-
-    Metric-aware (matches upstream v3.4.1): vector similarity is derived from
-    each candidate's ``distance`` via :func:`_distance_to_similarity` in the
-    collection's declared ``metric``. Candidates with ``distance=None``
-    (BM25-only) score on their BM25 contribution alone. BM25 is min-max
-    normalized within the candidate set so the weights are commensurable.
-
-    Mutates each result dict to add ``bm25_score`` and reorders in place.
-    (Not used by the fork's tuned ``_rerank_candidates`` pipeline; kept
-    metric-correct for the auxiliary/backend callers that import it.)
+    The warning fires only for palaces that clearly have the wrong
+    metric; palaces with no metadata table at all (empty dict) also
+    fall under this check since that is the signal of a pre-metadata
+    palace.
     """
-    if not results:
-        return results
+    try:
+        meta = getattr(col, "metadata", None)
+    except Exception:
+        return
+    if not isinstance(meta, dict):
+        return
+    space = meta.get("hnsw:space")
+    if space == "cosine":
+        return
+    # Either missing or set to something else — both are suspect.
+    import sys as _sys
 
-    docs = [r.get("text", "") for r in results]
-    bm25_raw = _bm25_scores(query, docs)
-    max_bm25 = max(bm25_raw) if bm25_raw else 0.0
-    bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
-
-    scored = []
-    for r, raw, norm in zip(results, bm25_raw, bm25_norm):
-        vec_sim = _distance_to_similarity(r.get("distance"), metric)
-        r["bm25_score"] = round(raw, 3)
-        scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
-
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    results[:] = [r for _, r in scored]
-    return results
+    detail = f"hnsw:space={space!r}" if space else "no hnsw:space metadata"
+    print(
+        f"\n  NOTICE: this palace was created without cosine distance ({detail}).\n"
+        "          Semantic similarity scores will not be meaningful.\n"
+        "          Run `mempalace repair` to rebuild the index with the correct metric.",
+        file=_sys.stderr,
+    )
 
 
-# ── Retrieval ──────────────────────────────────────────────────────────
+def _hnsw_capacity_diverged(palace_path: str) -> bool:
+    """Return True if HNSW divergence is severe enough to crash ChromaDB.
+
+    Thin, exception-safe wrapper around
+    :func:`mempalace.backends.chroma.hnsw_capacity_status`. Used by the
+    CLI search path to short-circuit to the BM25-only fallback before
+    opening a Chroma client. Client construction and collection identity
+    checks can themselves touch the damaged index, so guarding only
+    ``col.query()`` is too late (#1222 covers the MCP path via the module-level
+    ``_vector_disabled`` flag; this covers the CLI path).
+
+    A probe that raises falls through to ``False`` so the caller proceeds
+    to the normal vector path — the underlying query then either succeeds
+    (probe was a false negative) or raises its own diagnostic error. The
+    probe itself must never be the thing that crashes search.
+    """
+    try:
+        from .backends.chroma import hnsw_capacity_status
+        from .config import get_configured_collection_name
+
+        info = hnsw_capacity_status(palace_path, get_configured_collection_name())
+        return bool(info.get("diverged"))
+    except Exception:
+        logger.debug("HNSW capacity probe raised; proceeding to vector path", exc_info=True)
+        return False
 
 
-def _semantic_candidates(collection, query: str, where: dict, n_results: int) -> list:
-    """Run multiple query variants; merge per-id with minimum distance."""
-    fetch_limit = max(n_results * DEFAULT_OVERFETCH_FACTOR, DEFAULT_MIN_CANDIDATES)
-    merged = {}
+def _print_search_results_bm25_only(
+    query: str, palace_path: str, wing: str, room: str, n_results: int
+) -> None:
+    """CLI fallback printer for when HNSW divergence fences off vector search.
 
-    for variant in _build_query_variants(query):
+    Mirrors the vector-path output shape so users get lexical matches in
+    the format they expect, plus a clear notice pointing at
+    ``mempalace repair``. Replaces the silent SIGBUS users otherwise hit
+    when the CLI called ``col.query()`` against a diverged segment.
+    """
+    result = _bm25_only_via_sqlite(
+        query=query,
+        palace_path=palace_path,
+        wing=wing,
+        room=room,
+        n_results=n_results,
+    )
+    hits = result.get("results", [])
+
+    print(
+        "\n  NOTICE: vector search disabled — HNSW index has diverged from SQLite.\n"
+        "          Showing BM25-only results. Run `mempalace repair` to restore "
+        "vector search.\n"
+    )
+    print(f"{'=' * 60}")
+    print(f'  Results for: "{query}"')
+    if wing:
+        print(f"  Wing: {wing}")
+    if room:
+        print(f"  Room: {room}")
+    print(f"{'=' * 60}\n")
+
+    if not hits:
+        print(f'  No results found for: "{query}"')
+        return
+
+    for i, hit in enumerate(hits, 1):
+        bm25 = hit.get("bm25_score", 0.0)
+        wing_name = hit.get("wing", "?")
+        room_name = hit.get("room", "?")
+        source = Path(hit.get("source_file", "?")).name
+
+        print(f"  [{i}] {wing_name} / {room_name}")
+        print(f"      Source: {source}")
+        print(f"      Match:  bm25={bm25}  (vector disabled)")
+        print()
+        for line in (hit.get("text", "") or "").strip().split("\n"):
+            print(f"      {line}")
+        print()
+        print(f"  {'─' * 56}")
+
+    print()
+
+
+def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
+    """
+    Search the palace. Returns verbatim drawer content.
+    Optionally filter by wing (project) or room (aspect).
+    """
+    # Probe a Chroma palace before get_collection(). Opening the client can
+    # load native index state, and embedder-identity enforcement may call
+    # collection.count(); both happen before the old query-only guard and can
+    # hit the same native crash. Non-Chroma backends never use Chroma's HNSW
+    # files or sqlite-specific fallback and proceed normally.
+    try:
+        backend_name = resolve_backend_name(palace_path)
+    except (BackendMismatchError, KeyError):
+        # Preserve _open_collection_or_explain's state-specific diagnostics
+        # for mixed artifacts and unknown backend selections. This probe is
+        # only an early Chroma safety fence; it must not become a second,
+        # less-helpful backend validation path.
+        backend_name = None
+
+    if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
+        return _print_search_results_bm25_only(query, palace_path, wing, room, n_results)
+
+    col = _open_collection_or_explain(palace_path, opener=get_collection)
+    if col is None:
+        if not os.path.isdir(palace_path):
+            raise SearchError(f"No palace found at {palace_path}")
+        raise SearchError(f"No palace database at {palace_path}")
+
+    # Alert the user if this palace predates hnsw:space=cosine being set on
+    # creation — their similarity scores will be junk until they run repair.
+    _warn_if_legacy_metric(col)
+
+    where = build_where_filter(wing, room)
+
+    try:
         kwargs = {
-            "query_texts": [variant],
-            "n_results": fetch_limit,
+            "query_texts": [query],
+            "n_results": n_results,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
             kwargs["where"] = where
 
-        results = collection.query(**kwargs)
-        ids = _first_or_empty(results, "ids")
-        docs = _first_or_empty(results, "documents")
-        metas = _first_or_empty(results, "metadatas")
-        dists = _first_or_empty(results, "distances")
+        results = col.query(**kwargs)
 
-        for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists)):
-            doc_id = ids[i] if i < len(ids) else f"_synth_{hash(doc)}"
-            current = merged.get(doc_id)
-            if current is None or dist < current["distance"]:
-                merged[doc_id] = {
-                    "id": doc_id,
-                    "text": doc or "",
-                    "metadata": meta if isinstance(meta, dict) else {},
-                    "distance": dist,
-                }
+    except Exception as e:
+        print(f"\n  Search error: {e}")
+        raise SearchError(f"Search error: {e}") from e
 
-    return list(merged.values())
+    docs = _first_or_empty(results, "documents")
+    metas = _first_or_empty(results, "metadatas")
+    dists = _first_or_empty(results, "distances")
 
-
-def _rerank_candidates(
-    query: str,
-    candidates: list,
-    closet_boost_by_source: dict,
-    max_distance: float,
-    n_results: int,
-) -> list:
-    """Rerank candidates using fork signals × BM25 × closet boost."""
-    if max_distance and max_distance > 0.0:
-        candidates = [c for c in candidates if c["distance"] <= max_distance]
-    if not candidates:
-        return []
-
-    query_entities = _extract_notable_entities(query)
-    normalized_entities = {_normalize_text(e) for e in query_entities}
-    query_keywords = _extract_keywords(query, excluded_tokens=normalized_entities)
-    query_phrases = _extract_quoted_phrases(query)
-
-    docs_for_bm25 = [c["text"] for c in candidates]
-    bm25_raw = _bm25_scores(query, docs_for_bm25)
-    max_bm25 = max(bm25_raw) if bm25_raw else 0.0
-    bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
-
-    for i, c in enumerate(candidates):
-        kw = _keyword_overlap(query_keywords, c["text"])
-        ph = _quoted_phrase_overlap(query_phrases, c["text"])
-        en = _entity_overlap(query_entities, c["text"])
-        tp = _temporal_overlap(query, c["metadata"])
-
-        fused = c["distance"]
-        if kw > 0:
-            fused *= 1.0 - DEFAULT_HYBRID_WEIGHT * kw
-        if ph > 0:
-            fused *= 1.0 - DEFAULT_QUOTED_PHRASE_WEIGHT * ph
-        if en > 0:
-            fused *= 1.0 - DEFAULT_ENTITY_WEIGHT * en
-        if tp > 0:
-            fused *= 1.0 - DEFAULT_TEMPORAL_WEIGHT * tp
-
-        src = c["metadata"].get("source_file", "") or ""
-        closet_boost = 0.0
-        matched_via = "drawer"
-        closet_preview = None
-        if src and src in closet_boost_by_source:
-            c_rank, c_dist, c_preview = closet_boost_by_source[src]
-            if c_dist <= CLOSET_DISTANCE_CAP and c_rank < len(CLOSET_RANK_BOOSTS):
-                closet_boost = CLOSET_RANK_BOOSTS[c_rank]
-                matched_via = "drawer+closet"
-                closet_preview = c_preview
-        fused -= closet_boost
-
-        c["keyword_overlap"] = round(kw, 3)
-        c["phrase_overlap"] = round(ph, 3)
-        c["entity_overlap"] = round(en, 3)
-        c["temporal_overlap"] = round(tp, 3)
-        c["bm25_score"] = round(bm25_raw[i], 3)
-        c["bm25_norm"] = bm25_norm[i]
-        c["closet_boost"] = round(closet_boost, 3)
-        c["matched_via"] = matched_via
-        c["closet_preview"] = closet_preview
-        c["fused_distance"] = fused
-
-        vec_sim = max(0.0, 1.0 - fused)
-        c["_sort_score"] = DEFAULT_VECTOR_WEIGHT * vec_sim + DEFAULT_BM25_WEIGHT * bm25_norm[i]
-
-    candidates.sort(key=lambda c: (-c["_sort_score"], c["fused_distance"]))
-    # Collapse chunk-rows of the same logical drawer to their best-scoring chunk so a
-    # single verbose (chunked) drawer cannot occupy multiple result slots. Only chunk
-    # groups collapse (by parent_drawer_id / stripped _chunk_ id); distinct non-chunked
-    # drawers are never merged.
-    deduped = []
-    seen_logical = set()
-    for c in candidates:
-        m = c.get("metadata") or {}
-        cid = str(c.get("id") or "")
-        if m.get("parent_drawer_id"):
-            logical = m["parent_drawer_id"]
-        elif "_chunk_" in cid:
-            logical = cid.rsplit("_chunk_", 1)[0]
-        else:
-            logical = cid
-        if logical in seen_logical:
-            continue
-        seen_logical.add(logical)
-        deduped.append(c)
-        if len(deduped) >= n_results:
-            break
-    return deduped
-
-
-def _reassemble_logical_drawer(drawers_col, parent_id: str):
-    """Join all chunks of a logical drawer (parent_drawer_id == parent_id), ordered by
-    chunk_index, with NO separator — byte-exact match to get_drawer / _logical_chunk_group.
-    Returns {"text", "total_drawers"} or None when no chunk group is found.
-    """
-    try:
-        grp = drawers_col.get(
-            where={"parent_drawer_id": parent_id},
-            include=["documents", "metadatas"],
-        )
-    except Exception:
-        return None
-    docs = grp.get("documents") or []
-    metas = grp.get("metadatas") or []
     if not docs:
-        return None
-    rows = []
-    for d, m in zip(docs, metas):
-        ci = m.get("chunk_index", 0) if isinstance(m, dict) else 0
-        if not isinstance(ci, int):
-            ci = 0
-        rows.append((ci, d or ""))
-    rows.sort(key=lambda r: r[0])
-    return {"text": "".join(d for _, d in rows), "total_drawers": len(rows)}
-
-
-# ── Public API ─────────────────────────────────────────────────────────
-
-
-def _run_search(
-    query: str,
-    palace_path: str,
-    wing: str = None,
-    room: str = None,
-    n_results: int = 5,
-    max_distance: float = 0.0,
-    warn_legacy_metric: bool = False,
-) -> dict:
-    """Core search — returns a normalized dict shared by CLI and MCP paths."""
-    try:
-        drawers_col = get_collection(palace_path, create=False)
-    except BackendMismatchError as e:
-        return {
-            "error": "Backend mismatch",
-            "details": str(e),
-            "hint": "Select the matching backend or use a fresh palace directory.",
-        }
-    except KeyError as e:
-        return {
-            "error": "Unknown backend",
-            "details": str(e),
-            "hint": "Check MEMPALACE_BACKEND or the configured backend name.",
-        }
-    except (CollectionNotInitializedError, PalaceNotFoundError) as e:
-        logger.error("No palace found at %s: %s", palace_path, e)
-        return {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
-    except BackendError as e:
-        logger.error("Backend error opening palace at %s: %s", palace_path, e)
-        return {
-            "error": "Backend error",
-            "details": str(e),
-            "hint": "Check the selected backend configuration and availability.",
-        }
-    except Exception as e:
-        logger.error("No palace found at %s: %s", palace_path, e)
-        return {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
-
-    if warn_legacy_metric:
-        _warn_if_legacy_metric(drawers_col)
-
-    metric = _metric_for_collection(drawers_col)
-    where = _build_where_filter(wing=wing, room=room)
-
-    try:
-        candidates = _semantic_candidates(
-            drawers_col, query=query, where=where, n_results=n_results
-        )
-    except Exception as e:
-        return {"error": f"Search error: {e}"}
-
-    closet_boost_by_source = {}
-    try:
-        closets_col = get_closets_collection(palace_path, create=False)
-        ckwargs = {
-            "query_texts": [query],
-            "n_results": n_results * 2,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            ckwargs["where"] = where
-        closet_results = closets_col.query(**ckwargs)
-        for rank, (cdoc, cmeta, cdist) in enumerate(
-            zip(
-                _first_or_empty(closet_results, "documents"),
-                _first_or_empty(closet_results, "metadatas"),
-                _first_or_empty(closet_results, "distances"),
-            )
-        ):
-            if isinstance(cmeta, dict):
-                source = cmeta.get("source_file", "")
-            else:
-                source = ""
-            if source and source not in closet_boost_by_source:
-                closet_boost_by_source[source] = (rank, cdist, cdoc[:200])
-    except Exception:
-        pass  # no closets yet — hybrid degrades to pure drawer search
-
-    reranked = _rerank_candidates(
-        query=query,
-        candidates=candidates,
-        closet_boost_by_source=closet_boost_by_source,
-        max_distance=max_distance,
-        n_results=n_results,
-    )
-
-    hits = []
-    for c in reranked:
-        meta = c["metadata"] if isinstance(c["metadata"], dict) else {}
-        src_full = meta.get("source_file", "") or ""
-        created_at = meta.get("filed_at", "unknown")
-
-        hit = {
-            "text": c["text"],
-            "wing": meta.get("wing", "unknown"),
-            "room": meta.get("room", "unknown"),
-            "source_file": Path(src_full).name if src_full else "?",
-            "created_at": created_at,
-            "similarity": _distance_to_similarity(c["fused_distance"], metric),
-            "distance": round(c["distance"], 4),
-            "effective_distance": round(c["fused_distance"], 4),
-            "closet_boost": c["closet_boost"],
-            "matched_via": c["matched_via"],
-            "keyword_overlap": c["keyword_overlap"],
-            "phrase_overlap": c["phrase_overlap"],
-            "entity_overlap": c["entity_overlap"],
-            "temporal_overlap": c["temporal_overlap"],
-            "bm25_score": c["bm25_score"],
-        }
-        if c.get("closet_preview"):
-            hit["closet_preview"] = c["closet_preview"]
-
-        # Reassemble chunked logical drawers to FULL content so search returns the whole
-        # drawer, not an ~800-char fragment. Covers chunked drawers that carry NO
-        # source_file (diary/AAAK entries) which the closet/source_file expansion below
-        # never reached. Byte-exact join, same as get_drawer.
-        cid = str(c.get("id") or "")
-        parent_id = meta.get("parent_drawer_id") or (
-            cid.rsplit("_chunk_", 1)[0] if "_chunk_" in cid else None
-        )
-        if parent_id:
-            try:
-                full = _reassemble_logical_drawer(drawers_col, parent_id)
-                if full and full.get("text"):
-                    hit["text"] = full["text"]
-                    hit["total_drawers"] = full.get("total_drawers")
-            except Exception:
-                pass  # best-effort; fall back to the matched chunk text
-        elif c["matched_via"] == "drawer+closet" and src_full:
-            try:
-                expanded = _drawer_grep_expand(drawers_col, query, c["text"], meta, radius=1)
-                if expanded and expanded.get("text"):
-                    hit["text"] = expanded["text"]
-                    hit["drawer_index"] = expanded.get("drawer_index")
-                    hit["total_drawers"] = expanded.get("total_drawers")
-            except Exception:
-                pass  # expansion is best-effort
-
-        hits.append(hit)
-
-    return {
-        "query": query,
-        "filters": {"wing": wing, "room": room},
-        "total_before_filter": len(candidates),
-        "results": hits,
-        "metric": metric,
-    }
-
-
-def search(
-    query: str,
-    palace_path: str,
-    wing: str = None,
-    room: str = None,
-    n_results: int = 5,
-):
-    """CLI search — prints verbatim drawer content."""
-    result = _run_search(
-        query,
-        palace_path,
-        wing=wing,
-        room=room,
-        n_results=n_results,
-        warn_legacy_metric=True,
-    )
-    if "error" in result:
-        print(f"\n  {result['error']} at {palace_path}")
-        if hint := result.get("hint"):
-            print(f"  {hint}")
-        raise SearchError(result["error"])
-
-    hits = result["results"]
-    if not hits:
         print(f'\n  No results found for: "{query}"')
         return
 
-    metric = result.get("metric", "cosine")
+    # Pure-cosine retrieval on the CLI path was missing lexical matches:
+    # a drawer whose text contains every query term can still score distance
+    # >= 1.0 against the natural-language query when the drawer is a
+    # mechanical artifact (directory listing, diff, log fragment) that
+    # embeds as file-tree noise rather than as prose about its subject.
+    # The MCP tool path already hybridizes BM25 with vector sim via
+    # `_hybrid_rank`; do the same here so CLI results match what agents
+    # see via `mempalace_search`.
+    metric = _metric_for_collection(col)
+    hits = [
+        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
+        for doc, meta, dist in zip(docs, metas, dists)
+    ]
+    hits = _hybrid_rank(hits, query, metric=metric)
+
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
     if wing:
@@ -1309,15 +819,19 @@ def search(
     print(f"{'=' * 60}\n")
 
     for i, hit in enumerate(hits, 1):
-        print(f"  [{i}] {hit['wing']} / {hit['room']}")
-        print(f"      Source: {hit['source_file']}")
-        bm25 = hit.get("bm25_score")
-        if bm25 is None:
-            print(f"      Match:  {hit['similarity']}")
-        else:
-            print(f"      Match:  {metric}_sim={hit['similarity']}  bm25={bm25}")
+        vec_sim = round(_distance_to_similarity(hit["distance"], metric), 3)
+        bm25 = hit.get("bm25_score", 0.0)
+        meta = hit["metadata"]
+        source = Path(meta.get("source_file", "?")).name
+        wing_name = meta.get("wing", "?")
+        room_name = meta.get("room", "?")
+
+        print(f"  [{i}] {wing_name} / {room_name}")
+        print(f"      Source: {source}")
+        print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
         print()
-        for line in (hit.get("text") or "").strip().split("\n"):
+        # Print the verbatim text, indented
+        for line in hit["text"].strip().split("\n"):
             print(f"      {line}")
         print()
         print(f"  {'─' * 56}")
@@ -1330,6 +844,7 @@ def _bm25_only_via_sqlite(
     palace_path: str,
     wing: str = None,
     room: str = None,
+    source_file: str = None,
     n_results: int = 5,
     max_candidates: int = 500,
     _include_internal: bool = False,
@@ -1365,7 +880,7 @@ def _bm25_only_via_sqlite(
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
         clauses = []
         params = []
-        for key, value in (("wing", wing), ("room", room)):
+        for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
             if not value:
                 continue
             clauses.append(
@@ -1388,7 +903,7 @@ def _bm25_only_via_sqlite(
         return "".join(clauses), params
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
     except sqlite3.Error as e:
         return {"error": f"sqlite open failed: {e}"}
 
@@ -1478,7 +993,7 @@ def _bm25_only_via_sqlite(
         if not candidate_ids:
             return {
                 "query": query,
-                "filters": {"wing": wing, "room": room},
+                "filters": {"wing": wing, "room": room, "source_file": source_file},
                 "total_before_filter": 0,
                 "results": [],
                 "fallback": "bm25_only_via_sqlite",
@@ -1514,6 +1029,8 @@ def _bm25_only_via_sqlite(
             continue
         if room and meta.get("room") != room:
             continue
+        if source_file and meta.get("source_file") != source_file:
+            continue
         full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
@@ -1521,7 +1038,9 @@ def _bm25_only_via_sqlite(
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
+                "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
+                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
                 "distance": None,
@@ -1533,7 +1052,6 @@ def _bm25_only_via_sqlite(
                 # multiple chunks. Stripped before this helper returns.
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
-                "_parent_drawer_id": meta.get("parent_drawer_id"),
             }
         )
 
@@ -1545,25 +1063,9 @@ def _bm25_only_via_sqlite(
         c["bm25_score"] = round(raw, 3)
         c["_score"] = (raw / max_bm25) if max_bm25 > 0 else 0.0
     candidates.sort(key=lambda c: c["_score"], reverse=True)
-    # Collapse chunk-rows of the same logical drawer (parent_drawer_id) to the best-
-    # scoring chunk so one chunked drawer can't fill multiple slots. (This emergency
-    # vector-disabled path returns the matched chunk's text, not a reassembled full
-    # drawer — callers hydrate via get_drawer(parent_drawer_id) if they need it.)
-    deduped = []
-    seen_logical = set()
-    for c in candidates:
-        pid = c.get("_parent_drawer_id")
-        key = pid if pid else id(c)
-        if key in seen_logical:
-            continue
-        seen_logical.add(key)
-        deduped.append(c)
-        if len(deduped) >= n_results:
-            break
-    hits = deduped
+    hits = candidates[:n_results]
     for h in hits:
         h.pop("_score", None)
-        h.pop("_parent_drawer_id", None)
         # Strip internal fields by default so the public BM25-only fallback
         # response stays clean. Callers that need chunk-precise dedup
         # (notably the union-merge path) opt in via _include_internal.
@@ -1573,11 +1075,483 @@ def _bm25_only_via_sqlite(
 
     return {
         "query": query,
-        "filters": {"wing": wing, "room": room},
+        "filters": {"wing": wing, "room": room, "source_file": source_file},
         "total_before_filter": len(candidates),
         "results": hits,
         "fallback": "bm25_only_via_sqlite",
         "fallback_reason": "vector_search_disabled",
+    }
+
+
+def _merge_bm25_union_candidates(
+    hits: list,
+    drawers_col,
+    query: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    max_distance: float = 0.0,
+    source_file: str = None,
+) -> None:
+    """Append top-K backend lexical candidates into ``hits`` in place.
+
+    Used by ``search_memories(..., candidate_strategy="union")`` to widen
+    the rerank pool's *source* (not just its size) — vector-only candidate
+    selection skips docs whose embeddings are far from the query even when
+    BM25 signal is strong.
+
+    Dedup is chunk-precise: the key is ``(_source_file_full, _chunk_index)``
+    so two files sharing a basename in different directories don't collide,
+    and a vector hit on chunk N of a file doesn't block BM25 from
+    contributing chunk M of the same file. Falls back to ``source_file``
+    only when full-path/chunk metadata is absent.
+
+    BM25-only additions carry ``distance=None`` so ``_hybrid_rank`` scores
+    them on BM25 contribution alone.
+
+    When ``max_distance > 0.0`` (a strict vector-distance threshold is
+    set), BM25-only candidates are skipped entirely — they have no vector
+    distance to satisfy the threshold, and silently injecting them would
+    break the existing ``max_distance`` guarantee that hybrid results lie
+    within the requested vector-distance bound.
+    """
+    if max_distance > 0.0:
+        return
+
+    where = build_where_filter(wing, room, source_file)
+    try:
+        lexical = drawers_col.lexical_search(
+            query=query,
+            n_results=n_results * 3,
+            where=where or None,
+        )
+    except UnsupportedCapabilityError:
+        raise
+    except Exception:
+        logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
+        return
+
+    bm25_extra = []
+    for hit in lexical.hits:
+        meta = hit.metadata or {}
+        full_source = meta.get("source_file", "") or ""
+        bm25_extra.append(
+            {
+                "text": hit.document or "",
+                "wing": meta.get("wing", "unknown"),
+                "room": meta.get("room", "unknown"),
+                "source_file": Path(full_source).name if full_source else "?",
+                "source_path": full_source,
+                "created_at": meta.get("filed_at", "unknown"),
+                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+                "similarity": None,
+                "distance": None,
+                "effective_distance": None,
+                "closet_boost": 0.0,
+                "matched_via": "bm25_backend",
+                "bm25_score": round(float(hit.score), 3),
+                "_source_file_full": full_source,
+                "_chunk_index": meta.get("chunk_index"),
+            }
+        )
+
+    def _dedup_key(entry: dict):
+        full = entry.get("_source_file_full")
+        ci = entry.get("_chunk_index")
+        if full and ci is not None:
+            return (full, ci)
+        # Fall back to basename only when richer metadata is missing —
+        # avoids silently dropping candidates on legacy data while still
+        # giving chunk-precise dedup whenever the metadata is present.
+        return entry.get("source_file")
+
+    seen = {_dedup_key(h) for h in hits}
+    for bh in bm25_extra:
+        key = _dedup_key(bh)
+        if not key or key == "?" or key in seen:
+            continue
+        bh["distance"] = None
+        bh["effective_distance"] = None
+        bh["closet_boost"] = 0.0
+        hits.append(bh)
+        seen.add(key)
+
+
+# Strategy dispatch — keeps search_memories' branch count under the
+# project's complexity ceiling (C901 max-complexity=25). New strategies
+# register here.
+_CANDIDATE_MERGERS = {
+    "vector": None,  # default no-op
+    "union": _merge_bm25_union_candidates,
+}
+
+
+def _validate_candidate_strategy(strategy: str) -> None:
+    """Raise ``ValueError`` for unknown strategies.
+
+    Called eagerly at the top of ``search_memories`` so invalid values
+    fail consistently regardless of whether the call routes through the
+    vector path, the BM25-only fallback, or returns an early error dict.
+    """
+    if strategy not in _CANDIDATE_MERGERS:
+        raise ValueError(
+            f"candidate_strategy must be one of {tuple(_CANDIDATE_MERGERS)}, got {strategy!r}"
+        )
+
+
+def _apply_candidate_strategy(
+    strategy: str,
+    hits: list,
+    drawers_col,
+    query: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    max_distance: float = 0.0,
+    source_file: str = None,
+) -> None:
+    """Dispatch to the registered merger for ``strategy``.
+
+    Strategy validity is assumed (``_validate_candidate_strategy`` runs
+    earlier); ``"vector"`` is a no-op.
+    """
+    merger = _CANDIDATE_MERGERS[strategy]
+    if merger is not None:
+        merger(
+            hits,
+            drawers_col,
+            query,
+            wing,
+            room,
+            n_results,
+            max_distance=max_distance,
+            source_file=source_file,
+        )
+
+
+def _apply_local_rank_signals(hits: list, query: str, metric: str) -> None:
+    """Retain the fork's phrase, entity, accent and temporal rank signals."""
+    entities = _extract_notable_entities(query)
+    entity_tokens = {_normalize_text(entity) for entity in entities}
+    keywords = _extract_keywords(query, excluded_tokens=entity_tokens)
+    phrases = _extract_quoted_phrases(query)
+
+    for hit in hits:
+        text = hit.get("text", "") or ""
+        keyword = _keyword_overlap(keywords, text)
+        phrase = _quoted_phrase_overlap(phrases, text)
+        entity = _entity_overlap(entities, text)
+        temporal = _temporal_overlap(
+            query,
+            {
+                "filed_at": hit.get("created_at"),
+                "authored_at": hit.get("authored_at"),
+            },
+        )
+        effective = hit.get("effective_distance")
+        if effective is None:
+            effective = hit.get("distance")
+        if effective is not None:
+            effective *= 1.0 - (_LOCAL_HYBRID_WEIGHT * keyword)
+            effective *= 1.0 - (_LOCAL_QUOTED_PHRASE_WEIGHT * phrase)
+            effective *= 1.0 - (_LOCAL_ENTITY_WEIGHT * entity)
+            effective *= 1.0 - (_LOCAL_TEMPORAL_WEIGHT * temporal)
+            effective = max(0.0, min(2.0, effective))
+            hit["effective_distance"] = round(effective, 4)
+            hit["similarity"] = round(_distance_to_similarity(effective, metric), 3)
+            hit["_sort_key"] = effective
+        hit["keyword_overlap"] = round(keyword, 3)
+        hit["phrase_overlap"] = round(phrase, 3)
+        hit["entity_overlap"] = round(entity, 3)
+        hit["temporal_overlap"] = round(temporal, 3)
+
+
+def _logical_hit_key(hit: dict):
+    parent_id = hit.get("_parent_drawer_id")
+    if parent_id:
+        return ("logical", parent_id)
+    row_id = str(hit.get("_row_id") or "")
+    if "_chunk_" in row_id:
+        return ("logical", row_id.rsplit("_chunk_", 1)[0])
+    if row_id:
+        return ("row", row_id)
+    return (
+        "source",
+        hit.get("_source_file_full") or hit.get("source_path") or hit.get("source_file"),
+        hit.get("_chunk_index"),
+    )
+
+
+def _dedupe_logical_hits(hits: list) -> list:
+    deduped = []
+    seen = set()
+    for hit in hits:
+        key = _logical_hit_key(hit)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(hit)
+    return deduped
+
+
+def _reassemble_logical_hit(drawers_col, hit: dict) -> None:
+    parent_id = hit.get("_parent_drawer_id")
+    row_id = str(hit.get("_row_id") or "")
+    if not parent_id and "_chunk_" in row_id:
+        parent_id = row_id.rsplit("_chunk_", 1)[0]
+    if not parent_id:
+        return
+    try:
+        group = drawers_col.get(
+            where={"parent_drawer_id": parent_id},
+            include=["documents", "metadatas"],
+        )
+        documents = (
+            group.get("documents", [])
+            if isinstance(group, dict)
+            else getattr(group, "documents", [])
+        ) or []
+        metadatas = (
+            group.get("metadatas", [])
+            if isinstance(group, dict)
+            else getattr(group, "metadatas", [])
+        ) or []
+        rows = []
+        for index, document in enumerate(documents):
+            metadata = metadatas[index] if index < len(metadatas) else {}
+            chunk_index = metadata.get("chunk_index", index) if metadata else index
+            rows.append((chunk_index if isinstance(chunk_index, int) else index, document or ""))
+        if rows:
+            rows.sort(key=lambda row: row[0])
+            hit["text"] = "".join(document for _, document in rows)
+            hit["total_drawers"] = len(rows)
+    except Exception:
+        logger.debug("Logical drawer reassembly failed for %s", parent_id, exc_info=True)
+
+
+def _finalize_candidate_hits(
+    *,
+    candidate_strategy: str,
+    hits: list,
+    drawers_col,
+    query: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    max_distance: float,
+    source_file: str = None,
+) -> tuple:
+    try:
+        _apply_candidate_strategy(
+            candidate_strategy,
+            hits,
+            drawers_col,
+            query,
+            wing,
+            room,
+            n_results,
+            max_distance=max_distance,
+            source_file=source_file,
+        )
+    except UnsupportedCapabilityError:
+        return [], {
+            "error": "candidate_strategy='union' requires a backend with lexical_search support",
+            "unsupported_capability": "supports_lexical_search",
+            "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
+        }
+
+    metric = _metric_for_collection(drawers_col)
+    _apply_local_rank_signals(hits, query, metric)
+    hits = _dedupe_logical_hits(_hybrid_rank(hits, query, metric=metric))[:n_results]
+    for h in hits:
+        _reassemble_logical_hit(drawers_col, h)
+        h.pop("_sort_key", None)
+        h.pop("_source_file_full", None)
+        h.pop("_chunk_index", None)
+        h.pop("_parent_drawer_id", None)
+        h.pop("_row_id", None)
+    return hits, None
+
+
+def _backend_mismatch_result(error: BackendMismatchError) -> dict:
+    return {
+        "error": "Backend mismatch",
+        "details": str(error),
+        "hint": "Select the matching backend or use a fresh palace directory.",
+    }
+
+
+def _unknown_backend_result(error: KeyError) -> dict:
+    return {
+        "error": "Unknown backend",
+        "details": str(error),
+        "hint": "Check MEMPALACE_BACKEND or the configured backend name.",
+    }
+
+
+def _vector_disabled_search(
+    *,
+    query: str,
+    palace_path: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    collection_name: str,
+    source_file: str = None,
+) -> dict:
+    try:
+        backend_name = resolve_backend_name(palace_path)
+    except BackendMismatchError as e:
+        return _backend_mismatch_result(e)
+    except KeyError as e:
+        return _unknown_backend_result(e)
+    if backend_name != "chroma":
+        return {
+            "error": "vector_disabled fallback is Chroma-only",
+            "unsupported_capability": "chroma_hnsw_fallback",
+            "backend": backend_name,
+            "hint": "Disable vector_disabled for non-Chroma backends.",
+        }
+    return _bm25_only_via_sqlite(
+        query,
+        palace_path,
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        n_results=n_results,
+        collection_name=collection_name,
+    )
+
+
+def _open_search_collection(palace_path: str, collection_name: str):
+    try:
+        return get_collection(palace_path, collection_name=collection_name, create=False), None
+    except BackendMismatchError as e:
+        return None, _backend_mismatch_result(e)
+    except KeyError as e:
+        return None, _unknown_backend_result(e)
+    except (CollectionNotInitializedError, PalaceNotFoundError) as e:
+        logger.error("No palace found at %s: %s", palace_path, e)
+        return None, {
+            "error": "No palace found",
+            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
+        }
+    except BackendError as e:
+        logger.error("Backend error opening palace at %s: %s", palace_path, e)
+        return None, {
+            "error": "Backend error",
+            "details": str(e),
+            "hint": "Check the selected backend configuration and availability.",
+        }
+    except Exception as e:
+        logger.error("No palace found at %s: %s", palace_path, e)
+        return None, {
+            "error": "No palace found",
+            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
+        }
+
+
+def _query_drawers_with_filter_fallback(
+    drawers_col, dkwargs, query, n_results, wing, room, source_file=None
+):
+    """Run the filtered drawer query, falling back to an unfiltered query plus a
+    Python-side post-filter when ChromaDB raises on the filtered query.
+
+    A ChromaDB HNSW/SQLite index mismatch makes filtered queries fail with
+    "Error finding id" even when unfiltered search works fine — it happens when
+    drawers are ingested via two different paths (e.g. bulk import vs MCP tool
+    calls), leaving the vector index inconsistent with the metadata store. We
+    retry unfiltered (over-fetching) and re-apply the wing/room/source_file filter in Python.
+    See #1245 / #1035.
+    """
+    where = dkwargs.get("where")
+    try:
+        return drawers_col.query(**dkwargs)
+    except Exception as filter_err:
+        if not where:
+            raise
+        logger.warning(
+            "Filtered search failed (%s); falling back to unfiltered + post-filter",
+            filter_err,
+        )
+        raw = drawers_col.query(
+            query_texts=[query],
+            n_results=min(n_results * 15, 500),
+            include=["documents", "metadatas", "distances"],
+        )
+        fids, fdocs, fmetas, fdists = [], [], [], []
+        raw_ids = _first_or_empty(raw, "ids")
+        for index, (doc, meta, dist) in enumerate(
+            zip(
+                _first_or_empty(raw, "documents"),
+                _first_or_empty(raw, "metadatas"),
+                _first_or_empty(raw, "distances"),
+            )
+        ):
+            meta = meta or {}
+            if wing and meta.get("wing") != wing:
+                continue
+            if room and meta.get("room") != room:
+                continue
+            if source_file and meta.get("source_file") != source_file:
+                continue
+            fids.append(raw_ids[index] if index < len(raw_ids) else f"_fallback_{index}")
+            fdocs.append(doc)
+            fmetas.append(meta)
+            fdists.append(dist)
+        return {
+            "ids": [fids],
+            "documents": [fdocs],
+            "metadatas": [fmetas],
+            "distances": [fdists],
+        }
+
+
+def _query_drawer_variants(
+    drawers_col,
+    *,
+    query: str,
+    where: dict,
+    n_results: int,
+    wing: str,
+    room: str,
+    source_file: str = None,
+):
+    """Query all local variants and keep the best distance per physical row."""
+    merged = {}
+    fetch_limit = max(n_results * 5, 25)
+    for variant in _build_query_variants(query):
+        dkwargs = {
+            "query_texts": [variant],
+            "n_results": fetch_limit,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            dkwargs["where"] = where
+        results = _query_drawers_with_filter_fallback(
+            drawers_col,
+            dkwargs,
+            variant,
+            n_results,
+            wing,
+            room,
+            source_file,
+        )
+        ids = _first_or_empty(results, "ids")
+        docs = _first_or_empty(results, "documents")
+        metas = _first_or_empty(results, "metadatas")
+        dists = _first_or_empty(results, "distances")
+        for index, (doc, meta, dist) in enumerate(zip(docs, metas, dists)):
+            row_id = ids[index] if index < len(ids) else f"_synth_{hash((doc, index))}"
+            current = merged.get(row_id)
+            if current is None or dist < current[2]:
+                merged[row_id] = (doc, meta, dist)
+    row_ids = list(merged)
+    return {
+        "ids": [row_ids],
+        "documents": [[merged[row_id][0] for row_id in row_ids]],
+        "metadatas": [[merged[row_id][1] for row_id in row_ids]],
+        "distances": [[merged[row_id][2] for row_id in row_ids]],
     }
 
 
@@ -1586,11 +1560,12 @@ def search_memories(
     palace_path: str,
     wing: str = None,
     room: str = None,
+    source_file: str = None,
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
-    candidate_strategy: str = "vector",  # jor-shim v3.3.5-compat: accept-and-ignore (union nao usado via MCP)
-    collection_name: str = None,  # jor-shim v3.3.5-compat: accept-and-ignore (palace single-collection)
+    candidate_strategy: str = "vector",
+    collection_name: str = None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -1601,41 +1576,267 @@ def search_memories(
         palace_path: Path to the ChromaDB palace directory.
         wing: Optional wing filter.
         room: Optional room filter.
+        source_file: Optional exact source_file filter. Matches the full
+            stored source_file value verbatim (#1815).
         n_results: Max results to return.
-        max_distance: Max cosine distance threshold (0.0 disables).
+        max_distance: Max cosine distance threshold. The palace collection uses
+            cosine distance (hnsw:space=cosine) — 0 = identical, 2 = opposite.
+            Results with distance > this value are filtered out. A value of
+            0.0 disables filtering. Typical useful range: 0.3–1.0.
         vector_disabled: When True, route to the sqlite-only BM25 fallback
-            used when the HNSW vector segment is unsafe to load.
-        candidate_strategy: "vector" (default). "union" is accepted for
-            upstream API parity but the fork's variant-expansion pipeline
-            already widens recall, so it behaves as "vector". Unknown values
-            raise ``ValueError`` (validated eagerly, before any branch).
+            (#1222). Set by the MCP server when the HNSW capacity probe
+            detects a divergence that would segfault chromadb on segment
+            load.
+        candidate_strategy: How candidates for the hybrid re-rank are gathered.
+
+            * ``"vector"`` (default) — preserves historical behavior: top
+              ``n_results * 3`` rows from the vector index are the rerank pool.
+              Cheap; works well when query and target docs agree in the
+              embedding space.
+            * ``"union"`` — also pull top ``n_results * 3`` lexical candidates
+              through the backend's ``lexical_search`` capability and merge
+              them into the rerank pool (deduped by source_file). Catches docs
+              with strong BM25 signal that are vector-distant from the query.
+              Perf depends on the selected backend; opt in until the cost is
+              characterized.
+
+              When ``max_distance > 0.0`` is also set, BM25-only candidates
+              are skipped — they have no vector distance and would silently
+              violate the requested distance threshold.
     """
-    if candidate_strategy not in ("vector", "union"):
-        raise ValueError(
-            f"candidate_strategy must be one of ('vector', 'union'), got {candidate_strategy!r}"
-        )
+    # Validate the strategy eagerly so invalid values fail the same way
+    # regardless of whether the call routes through the vector path or
+    # the BM25-only fallback below.
+    _validate_candidate_strategy(candidate_strategy)
 
     if vector_disabled:
-        return _bm25_only_via_sqlite(
-            query,
-            palace_path,
+        return _vector_disabled_search(
+            query=query,
+            palace_path=palace_path,
             wing=wing,
             room=room,
             n_results=n_results,
+            collection_name=collection_name,
+            source_file=source_file,
         )
 
-    return _run_search(
-        query,
-        palace_path,
+    drawers_col, open_error = _open_search_collection(palace_path, collection_name)
+    if open_error:
+        return open_error
+
+    metric = _metric_for_collection(drawers_col)
+    where = build_where_filter(wing, room, source_file)
+
+    # Hybrid retrieval: always query drawers directly (the floor), then use
+    # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
+    # GATE — direct drawer search is always the baseline.
+    #
+    # This avoids the "weak-closets regression" where narrative content
+    # produces low-signal closets (regex extraction matches few topics)
+    # and closet-first routing hides drawers that direct search would find.
+    try:
+        drawer_results = _query_drawer_variants(
+            drawers_col,
+            query=query,
+            where=where,
+            n_results=n_results,
+            wing=wing,
+            room=room,
+            source_file=source_file,
+        )
+    except Exception as e:
+        return {"error": f"Search error: {e}"}
+
+    # Gather closet hits (best-per-source) to build a boost lookup.
+    closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
+    try:
+        closets_col = get_closets_collection(palace_path, create=False)
+        ckwargs = {
+            "query_texts": [query],
+            "n_results": n_results * 2,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            ckwargs["where"] = where
+        closet_results = closets_col.query(**ckwargs)
+        for rank, (cdoc, cmeta, cdist) in enumerate(
+            zip(
+                _first_or_empty(closet_results, "documents"),
+                _first_or_empty(closet_results, "metadatas"),
+                _first_or_empty(closet_results, "distances"),
+            )
+        ):
+            cmeta = cmeta or {}
+            source = cmeta.get("source_file", "")
+            if source and source not in closet_boost_by_source:
+                closet_boost_by_source[source] = (rank, cdist, cdoc[:200])
+    except Exception:
+        # No closets yet — hybrid degrades to pure drawer search.
+        logger.debug("Closet collection unavailable; using drawer-only search", exc_info=True)
+
+    # Rank-based boost. The ordinal signal ("which closet matched best") is
+    # more reliable than absolute distance on narrative content, where
+    # closet distances cluster in 1.2-1.5 range regardless of match quality.
+    CLOSET_RANK_BOOSTS = [0.40, 0.25, 0.15, 0.08, 0.04]
+    CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
+
+    scored: list = []
+    drawer_ids = _first_or_empty(drawer_results, "ids")
+    for row_index, (doc, meta, dist) in enumerate(
+        zip(
+            _first_or_empty(drawer_results, "documents"),
+            _first_or_empty(drawer_results, "metadatas"),
+            _first_or_empty(drawer_results, "distances"),
+        )
+    ):
+        meta = meta or {}
+        doc = doc or ""
+        # Filter on raw distance before rounding to avoid precision loss.
+        if max_distance > 0.0 and dist > max_distance:
+            continue
+
+        meta = meta or {}
+        source = meta.get("source_file", "") or ""
+        boost = 0.0
+        matched_via = "drawer"
+        closet_preview = None
+        if source in closet_boost_by_source:
+            c_rank, c_dist, c_preview = closet_boost_by_source[source]
+            if c_dist <= CLOSET_DISTANCE_CAP and c_rank < len(CLOSET_RANK_BOOSTS):
+                boost = CLOSET_RANK_BOOSTS[c_rank]
+                matched_via = "drawer+closet"
+                closet_preview = c_preview
+
+        # Clamp to the valid cosine-distance range [0, 2]. When a strong
+        # closet boost (up to 0.40) exceeds the raw distance, the subtraction
+        # can go negative — which (a) yields ``similarity > 1.0`` downstream
+        # and (b) makes the sort key land *below* ordinary positive distances,
+        # inverting the ranking so the best hybrid matches sort last.
+        effective_dist = max(0.0, min(2.0, dist - boost))
+        entry = {
+            "text": doc,
+            "wing": meta.get("wing", "unknown"),
+            "room": meta.get("room", "unknown"),
+            # source_file is the basename (display); source_path is the full
+            # stored value, the round-trippable key for the source_file filter.
+            "source_file": Path(source).name if source else "?",
+            "source_path": source,
+            "created_at": meta.get("filed_at", "unknown"),
+            "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+            "similarity": round(_distance_to_similarity(effective_dist, metric), 3),
+            "distance": round(dist, 4),
+            "effective_distance": round(effective_dist, 4),
+            "closet_boost": round(boost, 3),
+            "matched_via": matched_via,
+            # Internal: retain the full source_file path + chunk_index so the
+            # enrichment step below doesn't have to reverse-lookup via
+            # basename-suffix matching (which silently collides when two
+            # files share a basename across different directories).
+            "_sort_key": effective_dist,
+            "_source_file_full": source,
+            "_chunk_index": meta.get("chunk_index"),
+            "_parent_drawer_id": meta.get("parent_drawer_id"),
+            "_row_id": (
+                drawer_ids[row_index] if row_index < len(drawer_ids) else f"_synth_{row_index}"
+            ),
+        }
+        if closet_preview:
+            entry["closet_preview"] = closet_preview
+        scored.append(entry)
+
+    scored.sort(key=lambda h: h["_sort_key"])
+    hits = scored
+
+    # Drawer-grep enrichment: for closet-boosted hits whose source has
+    # multiple drawers, return the keyword-best chunk + its immediate
+    # neighbors instead of just the drawer vector search landed on. The
+    # closet said "this source is relevant"; vector may have picked the
+    # wrong chunk within it; grep picks the right one.
+    MAX_HYDRATION_CHARS = 10000
+    for h in hits:
+        if h["matched_via"] == "drawer":
+            continue
+        full_source = h.get("_source_file_full") or ""
+        if not full_source:
+            continue
+        # Narrow by ``parent_drawer_id`` when present so unrelated
+        # chunked drawers sharing ``source_file`` do not stitch (#1580).
+        try:
+            source_drawers = drawers_col.get(
+                where=_scoped_source_filter(full_source, h.get("_parent_drawer_id")),
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
+            continue
+        docs = source_drawers.documents
+        metas_ = source_drawers.metadatas
+        if len(docs) <= 1:
+            continue
+
+        # Sort by chunk_index so best_idx + neighbors are positional.
+        indexed = []
+        for idx, (d, m) in enumerate(zip(docs, metas_)):
+            ci = m.get("chunk_index", idx) if isinstance(m, dict) else idx
+            if not isinstance(ci, int):
+                ci = idx
+            indexed.append((ci, d))
+        indexed.sort(key=lambda p: p[0])
+        ordered_docs = [d for _, d in indexed]
+
+        query_terms = set(_tokenize(query))
+        best_idx, best_score = 0, -1
+        for idx, d in enumerate(ordered_docs):
+            d_lower = d.lower()
+            s = sum(1 for t in query_terms if t in d_lower)
+            if s > best_score:
+                best_score, best_idx = s, idx
+
+        start = max(0, best_idx - 1)
+        end = min(len(ordered_docs), best_idx + 2)
+        expanded = "\n\n".join(ordered_docs[start:end])
+        if len(expanded) > MAX_HYDRATION_CHARS:
+            expanded = (
+                expanded[:MAX_HYDRATION_CHARS]
+                + f"\n\n[...truncated. {len(ordered_docs)} total drawers. "
+                "Use mempalace_get_drawer for full content.]"
+            )
+        h["text"] = expanded
+        h["drawer_index"] = best_idx
+        h["total_drawers"] = len(ordered_docs)
+
+    # Candidate strategy hook: optionally widen the rerank pool's *source*
+    # before ranking. Default ("vector") is a no-op; "union" merges top-K
+    # backend lexical candidates. See `_apply_candidate_strategy`.
+    # ``max_distance`` is forwarded so union mode can refuse to inject
+    # BM25-only (distance=None) candidates that would silently bypass the
+    # caller's strict distance threshold.
+    # The helper also runs the final BM25 hybrid re-rank and strips internal
+    # dedup fields before returning.
+    hits, strategy_error = _finalize_candidate_hits(
+        candidate_strategy=candidate_strategy,
+        hits=hits,
+        drawers_col=drawers_col,
+        query=query,
         wing=wing,
         room=room,
         n_results=n_results,
         max_distance=max_distance,
+        source_file=source_file,
     )
+    if strategy_error:
+        return strategy_error
+
+    return {
+        "query": query,
+        "filters": {"wing": wing, "room": room, "source_file": source_file},
+        "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
+        "results": hits,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Virtual line numbering — read-time grid for drawers (3.3.6, from upstream).
+# Virtual line numbering — read-time grid for drawers (3.3.6).
 #
 # Drawers are stored verbatim on disk. The reader applies a line-number grid
 # at read time so any drawer — numbered or not — can be sectioned by a closet

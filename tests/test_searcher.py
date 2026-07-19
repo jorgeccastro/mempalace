@@ -9,13 +9,58 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
+from mempalace.backends import BackendMismatchError
 from mempalace.searcher import (
     SearchError,
-    _build_query_variants,
-    _keyword_overlap,
+    build_where_filter,
+    get_collection,
     search,
     search_memories,
 )
+
+
+# ── build_where_filter (unit) ──────────────────────────────────────────
+
+
+class TestBuildWhereFilter:
+    """build_where_filter composes a ChromaDB where clause from optional
+    wing / room / source_file constraints (#1815). ChromaDB needs a ``$and``
+    only when ≥2 clauses are present; a single clause is returned bare and
+    zero clauses yield an empty filter."""
+
+    def test_no_filters_returns_empty(self):
+        assert build_where_filter() == {}
+
+    def test_wing_only(self):
+        assert build_where_filter(wing="backend") == {"wing": "backend"}
+
+    def test_room_only(self):
+        assert build_where_filter(room="auth") == {"room": "auth"}
+
+    def test_wing_and_room(self):
+        assert build_where_filter(wing="backend", room="auth") == {
+            "$and": [{"wing": "backend"}, {"room": "auth"}]
+        }
+
+    def test_source_file_only(self):
+        assert build_where_filter(source_file="auth.py") == {"source_file": "auth.py"}
+
+    def test_wing_and_source_file(self):
+        assert build_where_filter(wing="backend", source_file="auth.py") == {
+            "$and": [{"wing": "backend"}, {"source_file": "auth.py"}]
+        }
+
+    def test_room_and_source_file(self):
+        assert build_where_filter(room="auth", source_file="auth.py") == {
+            "$and": [{"room": "auth"}, {"source_file": "auth.py"}]
+        }
+
+    def test_wing_room_and_source_file(self):
+        assert build_where_filter(wing="backend", room="auth", source_file="auth.py") == {
+            "$and": [{"wing": "backend"}, {"room": "auth"}, {"source_file": "auth.py"}]
+        }
 
 
 # ── search_memories (API) ──────────────────────────────────────────────
@@ -39,6 +84,68 @@ class TestSearchMemories:
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
         assert all(r["wing"] == "project" and r["room"] == "frontend" for r in result["results"])
+
+    def test_source_file_filter(self, palace_path, seeded_collection):
+        result = search_memories("authentication module", palace_path, source_file="auth.py")
+        assert result["results"], "exact source_file match should return its drawer"
+        assert all(r["source_file"] == "auth.py" for r in result["results"])
+
+    def test_source_file_with_wing_filter(self, palace_path, seeded_collection):
+        result = search_memories("database", palace_path, wing="project", source_file="db.py")
+        assert result["results"]
+        assert all(
+            r["source_file"] == "db.py" and r["wing"] == "project" for r in result["results"]
+        )
+
+    def test_nonmatching_source_file_returns_empty_not_error(self, palace_path, seeded_collection):
+        result = search_memories("authentication", palace_path, source_file="nope.md")
+        assert "error" not in result
+        assert result["results"] == []
+
+    def test_filters_envelope_includes_source_file(self, palace_path, seeded_collection):
+        result = search_memories("authentication", palace_path, source_file="auth.py")
+        assert result["filters"]["source_file"] == "auth.py"
+
+    def test_result_exposes_full_source_path(self, palace_path, seeded_collection):
+        # The displayed source_file is a basename; source_path carries the full
+        # stored value so a caller can round-trip it back into a source_file filter.
+        result = search_memories("authentication module", palace_path)
+        hit = result["results"][0]
+        assert hit["source_file"] == "auth.py"
+        assert hit["source_path"] == "auth.py"
+
+    def test_source_file_filter_matches_full_path_not_basename(self, palace_path):
+        from mempalace.palace import get_collection
+
+        col = get_collection(palace_path, create=True)
+        col.upsert(
+            ids=["fp1"],
+            documents=["The deploy script restarts the gunicorn workers nightly."],
+            metadatas=[{"wing": "ops", "room": "deploy", "source_file": "/srv/app/deploy.sh"}],
+        )
+        # The full stored path matches and round-trips via source_path.
+        hit = search_memories(
+            "deploy gunicorn workers", palace_path, source_file="/srv/app/deploy.sh"
+        )
+        assert [h["source_path"] for h in hit["results"]] == ["/srv/app/deploy.sh"]
+        assert [h["source_file"] for h in hit["results"]] == ["deploy.sh"]
+        # The basename does NOT match — exact full-path semantics only (issue v1).
+        miss = search_memories("deploy gunicorn workers", palace_path, source_file="deploy.sh")
+        assert miss["results"] == []
+
+    def test_source_file_filter_honored_in_bm25_fallback(self, palace_path, seeded_collection):
+        # vector_disabled routes through _bm25_only_via_sqlite (#1222); the
+        # source_file filter must hold there too, not silently no-op.
+        result = search_memories(
+            "authentication module",
+            palace_path,
+            source_file="auth.py",
+            vector_disabled=True,
+            collection_name="mempalace_drawers",
+        )
+        assert "error" not in result
+        assert result["results"], "BM25 fallback should still find the auth drawer"
+        assert all(r["source_file"] == "auth.py" for r in result["results"])
 
     def test_n_results_limit(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, n_results=2)
@@ -90,6 +197,24 @@ class TestSearchMemories:
         assert "error" in result
         assert "query failed" in result["error"]
 
+    def test_search_memories_vector_path_uses_explicit_collection_name(self):
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+            "ids": [[]],
+        }
+
+        with patch("mempalace.searcher.get_collection", return_value=mock_col) as get_collection:
+            search_memories("test", "/fake/path", collection_name="custom_drawers")
+
+        get_collection.assert_called_once_with(
+            "/fake/path",
+            collection_name="custom_drawers",
+            create=False,
+        )
+
     def test_search_memories_filters_in_result(self, palace_path, seeded_collection):
         result = search_memories("test", palace_path, wing="project", room="backend")
         assert result["filters"]["wing"] == "project"
@@ -108,7 +233,7 @@ class TestSearchMemories:
             "ids": [["d1", "d2"]],
         }
 
-        def mock_get_collection(path, create=False):
+        def mock_get_collection(path, collection_name=None, create=False):
             # First call: drawers. Second call: closets — raise so hybrid
             # degrades to pure drawer search (the catch block covers it).
             if not hasattr(mock_get_collection, "_called"):
@@ -126,64 +251,51 @@ class TestSearchMemories:
         assert none_hit["wing"] == "unknown"
         assert none_hit["room"] == "unknown"
 
-    def test_similarity_is_bounded(self, palace_path, seeded_collection):
-        result = search_memories("database", palace_path)
-        assert result["results"]
-        for hit in result["results"]:
-            assert 0.0 <= hit["similarity"] <= 1.0
+    def test_effective_distance_clamped_to_valid_cosine_range(self):
+        """A strong closet boost (up to 0.40) applied to a low-distance drawer
+        can drive ``dist - boost`` negative. That violates the cosine-distance
+        invariant ``[0, 2]``: the API returns ``similarity > 1.0`` and the
+        internal ``_sort_key`` sinks below ordinary positive distances,
+        inverting the ranking so the best hybrid matches sort last.
 
-    def test_keyword_overlap_is_accent_insensitive(self):
-        overlap = _keyword_overlap(
-            ["sincronizacao", "convidado"],
-            "sincronização de acesso convidado",
-        )
-        assert overlap == 1.0
-
-    def test_build_query_variants_adds_keyword_only_form(self):
-        variants = _build_query_variants("como ver pasta partilhada externa no OneDrive")
-        assert "como ver pasta partilhada externa no OneDrive" in variants
-        assert "ver pasta partilhada externa onedrive" in variants
-
-    def test_build_query_variants_adds_quoted_phrase(self):
-        variants = _build_query_variants('lembras-te de "sexual compulsions" e outras opcoes')
-        assert "sexual compulsions" in variants
-
-    def test_keyword_rerank_promotes_lexical_match(self):
-        mock_col = MagicMock()
-        mock_col.query.return_value = {
-            "ids": [["doc_b", "doc_a", "doc_c"]],
-            "documents": [
-                [
-                    "General cloud permissions discussion without the key terms.",
-                    "SharePoint guest access for an externally shared folder with sync enabled.",
-                    "Unrelated frontend planning note.",
-                ]
-            ],
+        With the clamp, ``effective_distance`` stays in ``[0, 2]``,
+        ``similarity`` stays in ``[0, 1]``, and the sort order is stable.
+        """
+        # Drawer a.md gets a tiny base distance (0.08) — nearly exact match.
+        # Drawer b.md gets a larger base distance (0.35).
+        drawers_col = MagicMock()
+        drawers_col.query.return_value = {
+            "documents": [["doc-a", "doc-b"]],
             "metadatas": [
                 [
-                    {"wing": "project", "room": "backend", "source_file": "b.txt"},
-                    {"wing": "project", "room": "backend", "source_file": "a.txt"},
-                    {"wing": "notes", "room": "planning", "source_file": "c.txt"},
+                    {"source_file": "a.md", "wing": "w", "room": "r", "chunk_index": 0},
+                    {"source_file": "b.md", "wing": "w", "room": "r", "chunk_index": 0},
                 ]
             ],
-            "distances": [[0.20, 0.24, 0.80]],
+            "distances": [[0.08, 0.35]],
+            "ids": [["d-a", "d-b"]],
+        }
+        # A strong closet at rank 0 points at a.md → boost = 0.40,
+        # which exceeds a.md's base distance and would go negative without
+        # the clamp. No closet for b.md.
+        closets_col = MagicMock()
+        closets_col.query.return_value = {
+            "documents": [["closet-preview-a"]],
+            "metadatas": [[{"source_file": "a.md"}]],
+            "distances": [[0.2]],  # within CLOSET_DISTANCE_CAP (1.5)
+            "ids": [["c-a"]],
         }
 
         with (
-            patch("mempalace.searcher.get_collection", return_value=mock_col),
-            patch(
-                "mempalace.searcher.get_closets_collection",
-                side_effect=Exception("no closets"),
-            ),
+            patch("mempalace.searcher.get_collection", return_value=drawers_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=closets_col),
         ):
-            result = search_memories(
-                "guest access shared folder sync", "/tmp/fake-palace", n_results=2
-            )
+            result = search_memories("query", "/fake/path", n_results=5)
 
         hits = result["results"]
         assert hits, "should return results"
 
-        # Invariants on every hit (upstream v3.4.1).
+        # Invariants on every hit.
         for h in hits:
             assert 0.0 <= h["similarity"] <= 1.0, (
                 f"similarity out of range: {h['similarity']} for {h['source_file']}"
@@ -191,152 +303,11 @@ class TestSearchMemories:
             assert 0.0 <= h["effective_distance"] <= 2.0, (
                 f"effective_distance out of range: {h['effective_distance']} for {h['source_file']}"
             )
-        # Fork reranking promotes the lexical match above the nearer-by-distance doc.
-        assert result["results"][0]["source_file"] == "a.txt"
 
-    def test_query_variants_expand_candidate_pool(self):
-        def fake_query(**kwargs):
-            query = kwargs["query_texts"][0]
-            if query == "onedrive pasta externa convidado":
-                return {
-                    "ids": [["doc_a"]],
-                    "documents": [["Generic cloud discussion."]],
-                    "metadatas": [
-                        [{"wing": "project", "room": "backend", "source_file": "generic.txt"}]
-                    ],
-                    "distances": [[0.20]],
-                }
-            return {
-                "ids": [["doc_b"]],
-                "documents": [
-                    ["Pasta partilhada externa com acesso de convidado e sincronização local."]
-                ],
-                "metadatas": [
-                    [{"wing": "project", "room": "backend", "source_file": "expanded.txt"}]
-                ],
-                "distances": [[0.25]],
-            }
-
-        mock_col = MagicMock()
-        mock_col.query.side_effect = fake_query
-
-        with (
-            patch("mempalace.searcher.get_collection", return_value=mock_col),
-            patch(
-                "mempalace.searcher.get_closets_collection",
-                side_effect=Exception("no closets"),
-            ),
-        ):
-            result = search_memories(
-                "OneDrive pasta externa convidado", "/tmp/fake-palace", n_results=2
-            )
-        assert [hit["source_file"] for hit in result["results"]] == ["expanded.txt", "generic.txt"]
-
-    def test_quoted_phrase_boost_promotes_exact_phrase(self):
-        mock_col = MagicMock()
-        mock_col.query.return_value = {
-            "ids": [["doc_a", "doc_b"]],
-            "documents": [
-                [
-                    "General advice about habit formation and compulsion labels.",
-                    "You suggested sexual compulsions, sexual fixations, and related terms.",
-                ]
-            ],
-            "metadatas": [
-                [
-                    {"wing": "notes", "room": "general", "source_file": "generic.txt"},
-                    {"wing": "notes", "room": "general", "source_file": "quoted.txt"},
-                ]
-            ],
-            "distances": [[0.20, 0.29]],
-        }
-
-        with (
-            patch("mempalace.searcher.get_collection", return_value=mock_col),
-            patch(
-                "mempalace.searcher.get_closets_collection",
-                side_effect=Exception("no closets"),
-            ),
-        ):
-            result = search_memories(
-                'you suggested "sexual compulsions" and other options', "/tmp/fake-palace"
-            )
-        assert result["results"][0]["source_file"] == "quoted.txt"
-
-    def test_entity_boost_promotes_named_result(self):
-        mock_col = MagicMock()
-        mock_col.query.return_value = {
-            "ids": [["doc_a", "doc_b"]],
-            "documents": [
-                [
-                    "We talked about ukulele practice with a friend during the lesson.",
-                    "I started ukulele lessons with Rachel and we practiced together.",
-                ]
-            ],
-            "metadatas": [
-                [
-                    {"wing": "notes", "room": "music", "source_file": "generic.txt"},
-                    {"wing": "notes", "room": "music", "source_file": "rachel.txt"},
-                ]
-            ],
-            "distances": [[0.19, 0.24]],
-        }
-
-        with (
-            patch("mempalace.searcher.get_collection", return_value=mock_col),
-            patch(
-                "mempalace.searcher.get_closets_collection",
-                side_effect=Exception("no closets"),
-            ),
-        ):
-            result = search_memories(
-                "What did I do with Rachel on ukulele day?", "/tmp/fake-palace"
-            )
-        assert result["results"][0]["source_file"] == "rachel.txt"
-
-    def test_temporal_boost_prefers_recent_match(self, monkeypatch):
-        mock_col = MagicMock()
-        mock_col.query.return_value = {
-            "ids": [["doc_old", "doc_recent"]],
-            "documents": [
-                [
-                    "Backup review and deployment checklist for the infra team.",
-                    "Backup review and deployment checklist for the infra team.",
-                ]
-            ],
-            "metadatas": [
-                [
-                    {
-                        "wing": "ops",
-                        "room": "infra",
-                        "source_file": "old.txt",
-                        "filed_at": "2026-02-10T10:00:00",
-                    },
-                    {
-                        "wing": "ops",
-                        "room": "infra",
-                        "source_file": "recent.txt",
-                        "filed_at": "2026-04-02T10:00:00",
-                    },
-                ]
-            ],
-            "distances": [[0.22, 0.26]],
-        }
-
-        monkeypatch.setattr(
-            "mempalace.searcher._utc_now",
-            lambda: __import__("datetime").datetime(2026, 4, 9, 12, 0, 0),
-        )
-
-        with (
-            patch("mempalace.searcher.get_collection", return_value=mock_col),
-            patch(
-                "mempalace.searcher.get_closets_collection",
-                side_effect=Exception("no closets"),
-            ),
-        ):
-            result = search_memories("backup review last week", "/tmp/fake-palace")
-        assert result["results"][0]["source_file"] == "recent.txt"
+        # With the clamp, the closet-boosted a.md still ranks ahead of b.md —
+        # the boost still wins, but it no longer flips the ranking.
+        assert hits[0]["source_file"] == "a.md"
+        assert hits[0]["matched_via"] == "drawer+closet"
 
 
 # ── BM25 internals: None / empty document safety ─────────────────────
@@ -387,7 +358,7 @@ def fake_palace_path(tmp_path):
     backend instead of raising on State A / State B."""
     p = tmp_path / "palace"
     p.mkdir()
-    (p / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(p)
     return str(p)
 
 
@@ -555,3 +526,119 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         assert "[1]" in captured.out
         assert "[2]" in captured.out
+
+    def test_search_routes_to_bm25_when_hnsw_diverged(self, fake_palace_path, capsys):
+        """Regression: `mempalace search` on a diverged HNSW segment must not
+        segfault ChromaDB's Rust bindings.
+
+        The MCP path gates this via ``_vector_disabled`` (#1222); the CLI
+        path was missing the gate, so any query into a diverged palace
+        exited 139 (SIGBUS) at ``chromadb/api/rust.py:_query`` with zero
+        diagnostic output. This test verifies the CLI now probes
+        ``hnsw_capacity_status`` and routes to the BM25-only sqlite
+        fallback instead of calling ``col.query()`` against a segment
+        that would crash it.
+        """
+        bm25_result = {
+            "query": "anything",
+            "filters": {},
+            "total_before_filter": 1,
+            "results": [
+                {
+                    "text": "diary entry that matches the query",
+                    "wing": "wing_test",
+                    "room": "diary",
+                    "source_file": "test.jsonl",
+                    "bm25_score": 1.5,
+                    "distance": None,
+                }
+            ],
+            "fallback": "bm25_only_via_sqlite",
+            "fallback_reason": "vector_search_disabled",
+        }
+        with (
+            patch("mempalace.searcher.resolve_backend_name", return_value="chroma"),
+            patch(
+                "mempalace.backends.chroma.hnsw_capacity_status",
+                return_value={"diverged": True, "message": "test divergence"},
+            ),
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_result),
+            patch("mempalace.searcher.get_collection") as mock_get_collection,
+        ):
+            search("anything", fake_palace_path)
+        captured = capsys.readouterr()
+        # Routed to BM25 before opening Chroma at all. Client construction and
+        # identity enforcement can touch the same damaged native index, so a
+        # query-only guard is insufficient.
+        mock_get_collection.assert_not_called()
+        # User got actionable output, not a silent crash.
+        assert "mempalace repair" in captured.out
+        assert "diary entry that matches" in captured.out
+
+    def test_search_proceeds_to_vector_when_hnsw_healthy(self, fake_palace_path, capsys):
+        """Paired guard: when HNSW is healthy, the divergence probe must NOT
+        short-circuit to BM25 — vector search proceeds normally.
+
+        Prevents a regression where the gate accidentally always fires.
+        """
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "documents": [["a matching doc"]],
+            "metadatas": [[{"source_file": "a.md", "wing": "w", "room": "r"}]],
+            "distances": [[0.1]],
+        }
+        with (
+            patch("mempalace.searcher.resolve_backend_name", return_value="chroma"),
+            patch(
+                "mempalace.backends.chroma.hnsw_capacity_status",
+                return_value={"diverged": False, "status": "ok"},
+            ),
+            patch("mempalace.searcher._bm25_only_via_sqlite") as mock_bm25,
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+        ):
+            search("anything", fake_palace_path)
+        captured = capsys.readouterr()
+        # Vector path ran.
+        mock_col.query.assert_called_once()
+        # BM25 fallback was NOT invoked.
+        mock_bm25.assert_not_called()
+        assert "a matching doc" in captured.out
+
+    def test_search_does_not_run_chroma_probe_for_other_backends(self, fake_palace_path, capsys):
+        """The HNSW guard is Chroma-specific and must not fence other backends."""
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "documents": [["backend-native result"]],
+            "metadatas": [[{"source_file": "native.md", "wing": "w", "room": "r"}]],
+            "distances": [[0.1]],
+        }
+        with (
+            patch("mempalace.searcher.resolve_backend_name", return_value="sqlite_exact"),
+            patch("mempalace.backends.chroma.hnsw_capacity_status") as mock_probe,
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+        ):
+            search("anything", fake_palace_path)
+
+        mock_probe.assert_not_called()
+        mock_col.query.assert_called_once()
+        assert "backend-native result" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "resolution_error",
+        [BackendMismatchError("mixed backend artifacts"), KeyError("unknown_backend")],
+    )
+    def test_search_delegates_backend_resolution_errors_to_open_diagnostic(
+        self, fake_palace_path, resolution_error
+    ):
+        """The early HNSW fence must not replace normal CLI diagnostics."""
+        with (
+            patch("mempalace.searcher.resolve_backend_name", side_effect=resolution_error),
+            patch("mempalace.searcher._hnsw_capacity_diverged") as mock_probe,
+            patch("mempalace.searcher._open_collection_or_explain", return_value=None) as mock_open,
+        ):
+            with pytest.raises(SearchError):
+                search("anything", fake_palace_path)
+
+        mock_probe.assert_not_called()
+        mock_open.assert_called_once_with(fake_palace_path, opener=get_collection)
