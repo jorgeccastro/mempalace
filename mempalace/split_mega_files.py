@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import stat
 from pathlib import Path
 
 HOME = Path.home()
@@ -272,7 +273,14 @@ def main():
     mega_files = []
     max_scan_size = 500 * 1024 * 1024  # 500 MB
     for f in files:
-        if f.stat().st_size > max_scan_size:
+        file_stat = f.stat()
+        # ``glob`` lists a FIFO named ``x.txt`` like any other match, and
+        # read_text() on one blocks in the kernel until a writer appears.
+        # stat() never blocks, so the type decides before the open does.
+        if not stat.S_ISREG(file_stat.st_mode):
+            print(f"  SKIP: {f.name} (not a regular file)")
+            continue
+        if file_stat.st_size > max_scan_size:
             print(f"  SKIP: {f.name} exceeds {max_scan_size // (1024 * 1024)} MB limit")
             continue
         lines = f.read_text(errors="replace").splitlines(keepends=True)
@@ -285,7 +293,7 @@ def main():
         return
 
     print(f"\n{'=' * 60}")
-    print(f"  Mega-file splitter — {'DRY RUN' if args.dry_run else 'SPLITTING'}")
+    print(f"  Mega-file splitter -- {'DRY RUN' if args.dry_run else 'SPLITTING'}")
     print(f"{'=' * 60}")
     print(f"  Source:      {src_dir}")
     print(f"  Output:      {output_dir or 'same dir as source'}")
@@ -307,9 +315,9 @@ def main():
 
     print(f"{'-' * 60}")
     if args.dry_run:
-        print(f"  DRY RUN — would create {total_written} files from {len(mega_files)} mega-files")
+        print(f"  DRY RUN -- would create {total_written} files from {len(mega_files)} mega-files")
     else:
-        print(f"  Done — created {total_written} files from {len(mega_files)} mega-files")
+        print(f"  Done -- created {total_written} files from {len(mega_files)} mega-files")
     print()
 
 
