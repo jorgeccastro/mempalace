@@ -6946,9 +6946,7 @@ def _start_writer_idle_release_watchdog() -> None:
             except Exception:
                 logger.exception("writer idle-release check failed")
 
-    t = threading.Thread(
-        target=_watchdog, name="mcp-writer-idle-release", daemon=True
-    )
+    t = threading.Thread(target=_watchdog, name="mcp-writer-idle-release", daemon=True)
     t.start()
 
 
